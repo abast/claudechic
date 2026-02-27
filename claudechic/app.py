@@ -639,13 +639,9 @@ class ChatApp(App):
             env["VIRTUAL_ENV"] = ""
 
         # Use global permission mode from AgentManager (runtime source of truth)
-        # --yolo flag forces bypass regardless of config
+        # CLI flag --yolo sets global_permission_mode at init, no special handling needed here
         permission_mode = (
-            "bypassPermissions"
-            if self._skip_permissions
-            else (
-                self.agent_mgr.global_permission_mode if self.agent_mgr else "default"
-            )
+            self.agent_mgr.global_permission_mode if self.agent_mgr else "default"
         )
         return ClaudeAgentOptions(
             permission_mode=permission_mode,
@@ -708,6 +704,10 @@ class ChatApp(App):
         # Initialize AgentManager (but don't create agent yet - wait for screen ready)
         self.agent_mgr = AgentManager(self._make_options)
         self._wire_agent_manager_callbacks()
+
+        # Set global permission mode based on CLI flags
+        if self._skip_permissions:
+            self.agent_mgr.global_permission_mode = "bypassPermissions"
 
         # Initialize file index for fuzzy file search (doesn't need widgets)
         self._cwd = Path.cwd()
