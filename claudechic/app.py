@@ -451,8 +451,8 @@ class ChatApp(App):
         self.client = None
         if old:
             try:
-                await old.interrupt()
-            except Exception:
+                await asyncio.wait_for(old.interrupt(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
                 pass
             # Skip disconnect() - it causes race conditions with SDK cleanup.
             # interrupt() is sufficient to stop the subprocess.
@@ -1809,9 +1809,13 @@ class ChatApp(App):
             active_prompt.cancel()
             return
 
-        # Interrupt running agent - send interrupt to SDK
-        if self.client and self._agent and self._agent.status == "busy":
-            self.run_worker(self.client.interrupt(), exclusive=False)
+        # Interrupt running agent - route through agent.interrupt() which has
+        # a short timeout + SIGINT fallback (never blocks for 60s like bare
+        # client.interrupt() did, and never crashes the app on timeout).
+        if self._agent and self._agent.status == "busy":
+            self.run_worker(
+                self._agent.interrupt(), exclusive=False, exit_on_error=False
+            )
             self._hide_thinking()
             self.notify("Interrupted")
             self.chat_input.focus()

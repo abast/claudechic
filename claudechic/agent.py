@@ -418,7 +418,13 @@ class Agent:
         )
 
     async def interrupt(self) -> None:
-        """Interrupt current response."""
+        """Interrupt current response.
+
+        Uses a short timeout for the SDK interrupt call. If the CLI subprocess
+        doesn't acknowledge within 5 seconds, we send SIGINT directly to the
+        process — this is far more reliable than waiting for the 60-second
+        control-request timeout, and prevents the app from hanging/crashing.
+        """
         self._interrupted = True
         if self._response_task and not self._response_task.done():
             self._response_task.cancel()
@@ -429,11 +435,40 @@ class Agent:
 
         if self.client:
             try:
-                await self.client.interrupt()
-            except Exception:
-                pass
+                await asyncio.wait_for(self.client.interrupt(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as e:
+                log.warning("SDK interrupt timed out or failed (%s), sending SIGINT to CLI", e)
+                self._sigint_cli_process()
 
         self._set_status(AgentStatus.IDLE)
+
+    def _sigint_cli_process(self) -> None:
+        """Send SIGINT directly to the CLI subprocess as a last-resort interrupt.
+
+        This bypasses the SDK control protocol entirely and sends an OS-level
+        signal, which the CLI handles as Ctrl+C (abort current operation).
+        """
+        import signal
+
+        try:
+            client = self.client
+            if not client:
+                return
+            query = getattr(client, "_query", None)
+            if not query:
+                return
+            transport = getattr(query, "transport", None)
+            if not transport:
+                return
+            process = getattr(transport, "_process", None)
+            if process and process.pid and process.returncode is None:
+                log.info("Sending SIGINT to CLI subprocess (pid=%d)", process.pid)
+                import os
+                os.kill(process.pid, signal.SIGINT)
+        except (ProcessLookupError, OSError) as e:
+            log.debug("SIGINT fallback failed (process likely exited): %s", e)
+        except Exception as e:
+            log.warning("SIGINT fallback unexpected error: %s", e)
 
     async def _send_followup(self, message: str) -> None:
         """Send a follow-up message after brief delay (for 'do something else' flow)."""
