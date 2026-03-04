@@ -182,7 +182,7 @@ class Agent:
         self.permission_mode: str = "default"  # default, acceptEdits, plan
         self.session_allowed_tools: set[str] = set()  # Tools allowed for this session
         self._pending_followup: str | None = None  # Auto-send after current response
-        self.model: str | None = None  # Model override (None = SDK default)
+        self.model: str | None = "opus"  # Model override (None = SDK default)
 
         # Worktree finish state (for /worktree finish flow)
         self.finish_state: FinishState | None = None
