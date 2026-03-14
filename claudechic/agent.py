@@ -560,6 +560,14 @@ Key Rules:
     ) -> None:
         """Handle a single SDK message."""
         if isinstance(message, AssistantMessage):
+            # Capture model name on the last assistant ChatItem
+            if message.model and self.messages:
+                for item in reversed(self.messages):
+                    if item.role == "assistant":
+                        if item.metadata is None:
+                            item.metadata = MessageMetadata()
+                        item.metadata.model = message.model
+                        break
             parent_id = message.parent_tool_use_id
             for block in message.content:
                 # Skip TextBlock - handled via StreamEvent for streaming

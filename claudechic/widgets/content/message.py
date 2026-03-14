@@ -37,6 +37,8 @@ class MessageMetadataHeader(Static):
         output_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         cache_read_tokens: int | None = None,
+        duration_ms: int | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         super().__init__()
         self.timestamp = timestamp
@@ -45,78 +47,130 @@ class MessageMetadataHeader(Static):
         self.output_tokens = output_tokens
         self.cache_creation_tokens = cache_creation_tokens
         self.cache_read_tokens = cache_read_tokens
+        self.duration_ms = duration_ms
+        self.cost_usd = cost_usd
         self._update_display()
 
+    @staticmethod
+    def _fmt_tokens(n: int) -> str:
+        """Format token count compactly: 1234 -> '1.2K', 12345 -> '12K'."""
+        if n < 1000:
+            return str(n)
+        elif n < 10_000:
+            return f"{n / 1000:.1f}K"
+        elif n < 1_000_000:
+            k = n / 1000
+            return f"{k:.0f}K"
+        else:
+            return f"{n / 1_000_000:.1f}M"
+
     def _format_timestamp(self) -> str:
-        """Format ISO timestamp to 24-hour format with seconds."""
+        """Format ISO timestamp to local time (HH:MM:SS)."""
         if not self.timestamp:
             return ""
         try:
-            # Parse ISO format timestamp
             dt = datetime.fromisoformat(self.timestamp.replace("Z", "+00:00"))
-            # Format as 24-hour with seconds
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
+            local_dt = dt.astimezone()
+            return local_dt.strftime("%H:%M:%S")
         except (ValueError, AttributeError):
             return self.timestamp
 
     def _shorten_model(self) -> str:
-        """Shorten model name to last segment (e.g., claude-opus-4-1 -> opus-4-1)."""
+        """Shorten model name (e.g., claude-opus-4-1 -> opus-4-1)."""
         if not self.model:
             return ""
         parts = self.model.split("-")
-        # Extract meaningful model name (skip "claude" prefix)
         if parts and parts[0] == "claude":
             return "-".join(parts[1:])
         return self.model
 
     def _format_tokens(self) -> str:
-        """Format token usage info."""
+        """Format token usage as 'in -> out' with compact numbers."""
         if self.input_tokens is None and self.output_tokens is None:
             return ""
 
         parts = []
         if self.input_tokens is not None:
-            parts.append(f"{self.input_tokens}")
+            parts.append(f"{self._fmt_tokens(self.input_tokens)} in")
         if self.output_tokens is not None:
-            parts.append(f"{self.output_tokens}")
+            parts.append(f"{self._fmt_tokens(self.output_tokens)} out")
 
-        tokens_str = " → ".join(parts) if parts else ""
+        tokens_str = " / ".join(parts) if parts else ""
 
         # Add cache info if available
         cache_parts = []
-        if self.cache_creation_tokens:
-            cache_parts.append(f"new:{self.cache_creation_tokens}")
         if self.cache_read_tokens:
-            cache_parts.append(f"reused:{self.cache_read_tokens}")
+            cache_parts.append(f"{self._fmt_tokens(self.cache_read_tokens)} cached")
+        if self.cache_creation_tokens:
+            cache_parts.append(f"{self._fmt_tokens(self.cache_creation_tokens)} new cache")
 
         if tokens_str and cache_parts:
             return f"{tokens_str} ({', '.join(cache_parts)})"
         return tokens_str
 
+    def _format_duration(self) -> str:
+        """Format duration_ms to human readable."""
+        if self.duration_ms is None:
+            return ""
+        secs = self.duration_ms / 1000
+        if secs < 60:
+            return f"{secs:.1f}s"
+        mins = int(secs // 60)
+        remaining = secs % 60
+        return f"{mins}m{remaining:.0f}s"
+
     def _update_display(self) -> None:
         """Update the displayed metadata."""
         parts = []
 
-        # Add timestamp
         ts_str = self._format_timestamp()
         if ts_str:
-            parts.append(f"⏱️  {ts_str}")
+            parts.append(ts_str)
 
-        # Add model
         model_str = self._shorten_model()
         if model_str:
-            parts.append(f"🤖 {model_str}")
+            parts.append(model_str)
 
-        # Add tokens
         tokens_str = self._format_tokens()
         if tokens_str:
-            parts.append(f"⚡ {tokens_str}")
+            parts.append(tokens_str)
 
-        # Create separator
-        separator = " │ " if parts else ""
-        display_text = separator.join(parts)
+        dur_str = self._format_duration()
+        if dur_str:
+            parts.append(dur_str)
 
+        if self.cost_usd is not None:
+            parts.append(f"${self.cost_usd:.4f}")
+
+        display_text = " | ".join(parts)
         self.update(display_text if display_text else "")
+
+    def update_metadata(
+        self,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+        duration_ms: int | None = None,
+        cost_usd: float | None = None,
+    ) -> None:
+        """Update token usage, model, and duration after response completes."""
+        if model is not None:
+            self.model = model
+        if input_tokens is not None:
+            self.input_tokens = input_tokens
+        if output_tokens is not None:
+            self.output_tokens = output_tokens
+        if cache_creation_tokens is not None:
+            self.cache_creation_tokens = cache_creation_tokens
+        if cache_read_tokens is not None:
+            self.cache_read_tokens = cache_read_tokens
+        if duration_ms is not None:
+            self.duration_ms = duration_ms
+        if cost_usd is not None:
+            self.cost_usd = cost_usd
+        self._update_display()
 
 
 class ThinkingIndicator(Spinner):
@@ -233,6 +287,8 @@ class ChatMessage(Static):
         output_tokens: int | None = None,
         cache_creation_tokens: int | None = None,
         cache_read_tokens: int | None = None,
+        duration_ms: int | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         super().__init__()
         self._initial_content = content.rstrip()  # Content to render in compose()
@@ -249,6 +305,8 @@ class ChatMessage(Static):
         self._output_tokens = output_tokens
         self._cache_creation_tokens = cache_creation_tokens
         self._cache_read_tokens = cache_read_tokens
+        self._duration_ms = duration_ms
+        self._cost_usd = cost_usd
 
     def _is_streaming(self) -> bool:
         """Check if we're actively streaming content."""
@@ -274,6 +332,8 @@ class ChatMessage(Static):
                 output_tokens=self._output_tokens,
                 cache_creation_tokens=self._cache_creation_tokens,
                 cache_read_tokens=self._cache_read_tokens,
+                duration_ms=self._duration_ms,
+                cost_usd=self._cost_usd,
             )
 
         # Only render initial content - streaming content goes through MarkdownStream
