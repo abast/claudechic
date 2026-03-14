@@ -138,27 +138,40 @@ class ChatView(AutoHideScroll):
         if not self._agent:
             return
 
-        # Group messages into turns (user + assistant pairs)
-        turns: list[tuple[UserContent | None, AssistantContent | None]] = []
+        # Group messages into turns (user + assistant pairs) with metadata
+        from claudechic.agent import MessageMetadata
+        turns: list[
+            tuple[
+                UserContent | None,
+                AssistantContent | None,
+                MessageMetadata | None,
+                MessageMetadata | None,
+            ]
+        ] = []
         current_user: UserContent | None = None
+        current_user_metadata: MessageMetadata | None = None
 
         for item in self._agent.messages:
             if item.role == "user" and isinstance(item.content, UserContent):
                 # Start new turn
                 if current_user is not None:
                     # Previous user had no assistant response
-                    turns.append((current_user, None))
+                    turns.append((current_user, None, current_user_metadata, None))
                 current_user = item.content
+                current_user_metadata = item.metadata
             elif item.role == "assistant" and isinstance(
                 item.content, AssistantContent
             ):
                 # Complete current turn
-                turns.append((current_user, item.content))
+                turns.append(
+                    (current_user, item.content, current_user_metadata, item.metadata)
+                )
                 current_user = None
+                current_user_metadata = None
 
         # Handle trailing user message with no response yet
         if current_user is not None:
-            turns.append((current_user, None))
+            turns.append((current_user, None, current_user_metadata, None))
 
         # Determine which turns to collapse (all but last RECENT_TURNS_FULL)
         collapse_before = max(0, len(turns) - RECENT_TURNS_FULL)
@@ -175,7 +188,9 @@ class ChatView(AutoHideScroll):
         # Build widgets
         widgets: list[Widget] = []
 
-        for turn_idx, (user_content, assistant_content) in enumerate(turns):
+        for turn_idx, (user_content, assistant_content, user_metadata, assistant_metadata) in enumerate(
+            turns
+        ):
             if turn_idx < collapse_before and user_content and assistant_content:
                 # Old turn: collapse into single widget with lazy expansion
                 widgets.append(
@@ -185,12 +200,46 @@ class ChatView(AutoHideScroll):
                 # Recent turn: render fully
                 if user_content:
                     text, is_agent = format_agent_prompt(user_content.text)
+                    # Extract metadata fields if available
+                    user_ts = user_metadata.timestamp if user_metadata else None
+                    user_model = user_metadata.model if user_metadata else None
+                    user_in_tokens = user_metadata.input_tokens if user_metadata else None
+                    user_out_tokens = user_metadata.output_tokens if user_metadata else None
+                    user_cache_create = user_metadata.cache_creation_tokens if user_metadata else None
+                    user_cache_read = user_metadata.cache_read_tokens if user_metadata else None
+
                     widgets.extend(
-                        self._create_user_widgets(text, user_content.images, is_agent)
+                        self._create_user_widgets(
+                            text,
+                            user_content.images,
+                            is_agent,
+                            timestamp=user_ts,
+                            model=user_model,
+                            input_tokens=user_in_tokens,
+                            output_tokens=user_out_tokens,
+                            cache_creation_tokens=user_cache_create,
+                            cache_read_tokens=user_cache_read,
+                        )
                     )
                 if assistant_content:
+                    # Extract metadata fields if available
+                    asst_ts = assistant_metadata.timestamp if assistant_metadata else None
+                    asst_model = assistant_metadata.model if assistant_metadata else None
+                    asst_in_tokens = assistant_metadata.input_tokens if assistant_metadata else None
+                    asst_out_tokens = assistant_metadata.output_tokens if assistant_metadata else None
+                    asst_cache_create = assistant_metadata.cache_creation_tokens if assistant_metadata else None
+                    asst_cache_read = assistant_metadata.cache_read_tokens if assistant_metadata else None
+
                     new_widgets, tool_index = self._create_assistant_widgets(
-                        assistant_content, tool_index, collapse_threshold
+                        assistant_content,
+                        tool_index,
+                        collapse_threshold,
+                        timestamp=asst_ts,
+                        model=asst_model,
+                        input_tokens=asst_in_tokens,
+                        output_tokens=asst_out_tokens,
+                        cache_creation_tokens=asst_cache_create,
+                        cache_read_tokens=asst_cache_read,
                     )
                     widgets.extend(new_widgets)
 
@@ -223,11 +272,29 @@ class ChatView(AutoHideScroll):
         )
 
     def _create_user_widgets(
-        self, text: str, images: list[ImageAttachment], is_agent: bool = False
+        self,
+        text: str,
+        images: list[ImageAttachment],
+        is_agent: bool = False,
+        timestamp: str | None = None,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
     ) -> list[Widget]:
         """Create widgets for a user message (without mounting)."""
         widgets: list[Widget] = []
-        msg = ChatMessage(text, is_agent=is_agent)
+        msg = ChatMessage(
+            text,
+            is_agent=is_agent,
+            timestamp=timestamp,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
         msg.add_class("agent-message" if is_agent else "user-message")
         widgets.append(msg)
 
@@ -241,7 +308,16 @@ class ChatView(AutoHideScroll):
         return widgets
 
     def _create_assistant_widgets(
-        self, content: AssistantContent, tool_index: int, collapse_threshold: int
+        self,
+        content: AssistantContent,
+        tool_index: int,
+        collapse_threshold: int,
+        timestamp: str | None = None,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
     ) -> tuple[list[Widget], int]:
         """Create widgets for an assistant message (without mounting).
 
@@ -252,11 +328,23 @@ class ChatView(AutoHideScroll):
 
         widgets: list[Widget] = []
         pending_tools = self._agent.pending_tools if self._agent else {}
+        # Track if we've added metadata header for this assistant message
+        metadata_added = False
+
         for block in content.blocks:
             if isinstance(block, TextBlock):
-                msg = ChatMessage(block.text)
+                msg = ChatMessage(
+                    block.text,
+                    timestamp=timestamp if not metadata_added else None,
+                    model=model if not metadata_added else None,
+                    input_tokens=input_tokens if not metadata_added else None,
+                    output_tokens=output_tokens if not metadata_added else None,
+                    cache_creation_tokens=cache_creation_tokens if not metadata_added else None,
+                    cache_read_tokens=cache_read_tokens if not metadata_added else None,
+                )
                 msg.add_class("assistant-message")
                 widgets.append(msg)
+                metadata_added = True
             elif isinstance(block, ToolUse):
                 # Route nested tools to their parent TaskWidget
                 parent_id = block.parent_tool_use_id

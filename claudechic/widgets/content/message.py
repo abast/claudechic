@@ -2,6 +2,7 @@
 
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 from textual.app import ComposeResult
@@ -14,6 +15,108 @@ from claudechic.errors import log_exception
 from claudechic.widgets.primitives.button import Button
 from claudechic.widgets.primitives.spinner import Spinner
 from claudechic.widgets.input.vi_mode import ViHandler, ViMode
+
+
+class MessageMetadataHeader(Static):
+    """Metadata header shown above chat messages with timestamp, model, tokens."""
+
+    can_focus = False
+    DEFAULT_CSS = """
+    MessageMetadataHeader {
+        width: 100%;
+        height: 1;
+        padding: 0 2;
+    }
+    """
+
+    def __init__(
+        self,
+        timestamp: str | None = None,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.timestamp = timestamp
+        self.model = model
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_creation_tokens = cache_creation_tokens
+        self.cache_read_tokens = cache_read_tokens
+        self._update_display()
+
+    def _format_timestamp(self) -> str:
+        """Format ISO timestamp to 24-hour format with seconds."""
+        if not self.timestamp:
+            return ""
+        try:
+            # Parse ISO format timestamp
+            dt = datetime.fromisoformat(self.timestamp.replace("Z", "+00:00"))
+            # Format as 24-hour with seconds
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, AttributeError):
+            return self.timestamp
+
+    def _shorten_model(self) -> str:
+        """Shorten model name to last segment (e.g., claude-opus-4-1 -> opus-4-1)."""
+        if not self.model:
+            return ""
+        parts = self.model.split("-")
+        # Extract meaningful model name (skip "claude" prefix)
+        if parts and parts[0] == "claude":
+            return "-".join(parts[1:])
+        return self.model
+
+    def _format_tokens(self) -> str:
+        """Format token usage info."""
+        if self.input_tokens is None and self.output_tokens is None:
+            return ""
+
+        parts = []
+        if self.input_tokens is not None:
+            parts.append(f"{self.input_tokens}")
+        if self.output_tokens is not None:
+            parts.append(f"{self.output_tokens}")
+
+        tokens_str = " → ".join(parts) if parts else ""
+
+        # Add cache info if available
+        cache_parts = []
+        if self.cache_creation_tokens:
+            cache_parts.append(f"new:{self.cache_creation_tokens}")
+        if self.cache_read_tokens:
+            cache_parts.append(f"reused:{self.cache_read_tokens}")
+
+        if tokens_str and cache_parts:
+            return f"{tokens_str} ({', '.join(cache_parts)})"
+        return tokens_str
+
+    def _update_display(self) -> None:
+        """Update the displayed metadata."""
+        parts = []
+
+        # Add timestamp
+        ts_str = self._format_timestamp()
+        if ts_str:
+            parts.append(f"⏱️  {ts_str}")
+
+        # Add model
+        model_str = self._shorten_model()
+        if model_str:
+            parts.append(f"🤖 {model_str}")
+
+        # Add tokens
+        tokens_str = self._format_tokens()
+        if tokens_str:
+            parts.append(f"⚡ {tokens_str}")
+
+        # Create separator
+        separator = " │ " if parts else ""
+        display_text = separator.join(parts)
+
+        self.update(display_text if display_text else "")
 
 
 class ThinkingIndicator(Spinner):
@@ -120,7 +223,17 @@ class ChatMessage(Static):
     _DEBOUNCE_INTERVAL = 0.05  # 50ms - flush accumulated text at most 20x/sec
     _DEBOUNCE_MAX_CHARS = 200  # Flush immediately if buffer exceeds this
 
-    def __init__(self, content: str = "", is_agent: bool = False) -> None:
+    def __init__(
+        self,
+        content: str = "",
+        is_agent: bool = False,
+        timestamp: str | None = None,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_creation_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+    ) -> None:
         super().__init__()
         self._initial_content = content.rstrip()  # Content to render in compose()
         self._content = self._initial_content  # Full accumulated content
@@ -129,12 +242,40 @@ class ChatMessage(Static):
         self._pending_text = ""  # Accumulated text waiting to be flushed
         self._flush_timer = None  # Timer for debounced flush
         self._first_flush_done = False  # Track if first stream write has happened
+        # Metadata
+        self._timestamp = timestamp
+        self._model = model
+        self._input_tokens = input_tokens
+        self._output_tokens = output_tokens
+        self._cache_creation_tokens = cache_creation_tokens
+        self._cache_read_tokens = cache_read_tokens
 
     def _is_streaming(self) -> bool:
         """Check if we're actively streaming content."""
         return bool(self._pending_text) or self._flush_timer is not None
 
     def compose(self) -> ComposeResult:
+        # Render metadata header if available and enabled in config
+        from claudechic.config import CONFIG
+
+        show_metadata = CONFIG.get("show_message_metadata", True)
+        has_metadata = any([
+            self._timestamp,
+            self._model,
+            self._input_tokens is not None,
+            self._output_tokens is not None,
+        ])
+
+        if has_metadata and show_metadata:
+            yield MessageMetadataHeader(
+                timestamp=self._timestamp,
+                model=self._model,
+                input_tokens=self._input_tokens,
+                output_tokens=self._output_tokens,
+                cache_creation_tokens=self._cache_creation_tokens,
+                cache_read_tokens=self._cache_read_tokens,
+            )
+
         # Only render initial content - streaming content goes through MarkdownStream
         # This prevents duplication when append_content() is called before compose() runs
         if self._is_agent:
