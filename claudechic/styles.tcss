@@ -154,7 +154,6 @@ ChatMessage {
 /* Message metadata header - timestamp, model, tokens */
 MessageMetadataHeader {
     color: $text-muted;
-    text-style: dim;
     height: 1;
     padding: 0 2 0 2;
     margin: 0 2 0 0;

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from textual.widget import Widget
 
@@ -179,7 +179,7 @@ class ChatView(AutoHideScroll):
         # Count tools in recent turns for tool collapse threshold
         recent_tools = sum(
             sum(1 for b in asst.blocks if isinstance(b, ToolUse))
-            for _, asst in turns[collapse_before:]
+            for _, asst, _, _ in turns[collapse_before:]
             if asst is not None
         )
         collapse_threshold = recent_tools - RECENT_TOOLS_EXPANDED
@@ -200,46 +200,21 @@ class ChatView(AutoHideScroll):
                 # Recent turn: render fully
                 if user_content:
                     text, is_agent = format_agent_prompt(user_content.text)
-                    # Extract metadata fields if available
                     user_ts = user_metadata.timestamp if user_metadata else None
-                    user_model = user_metadata.model if user_metadata else None
-                    user_in_tokens = user_metadata.input_tokens if user_metadata else None
-                    user_out_tokens = user_metadata.output_tokens if user_metadata else None
-                    user_cache_create = user_metadata.cache_creation_tokens if user_metadata else None
-                    user_cache_read = user_metadata.cache_read_tokens if user_metadata else None
-
                     widgets.extend(
                         self._create_user_widgets(
                             text,
                             user_content.images,
                             is_agent,
                             timestamp=user_ts,
-                            model=user_model,
-                            input_tokens=user_in_tokens,
-                            output_tokens=user_out_tokens,
-                            cache_creation_tokens=user_cache_create,
-                            cache_read_tokens=user_cache_read,
                         )
                     )
                 if assistant_content:
-                    # Extract metadata fields if available
-                    asst_ts = assistant_metadata.timestamp if assistant_metadata else None
-                    asst_model = assistant_metadata.model if assistant_metadata else None
-                    asst_in_tokens = assistant_metadata.input_tokens if assistant_metadata else None
-                    asst_out_tokens = assistant_metadata.output_tokens if assistant_metadata else None
-                    asst_cache_create = assistant_metadata.cache_creation_tokens if assistant_metadata else None
-                    asst_cache_read = assistant_metadata.cache_read_tokens if assistant_metadata else None
-
                     new_widgets, tool_index = self._create_assistant_widgets(
                         assistant_content,
                         tool_index,
                         collapse_threshold,
-                        timestamp=asst_ts,
-                        model=asst_model,
-                        input_tokens=asst_in_tokens,
-                        output_tokens=asst_out_tokens,
-                        cache_creation_tokens=asst_cache_create,
-                        cache_read_tokens=asst_cache_read,
+                        metadata=assistant_metadata,
                     )
                     widgets.extend(new_widgets)
 
@@ -277,24 +252,10 @@ class ChatView(AutoHideScroll):
         images: list[ImageAttachment],
         is_agent: bool = False,
         timestamp: str | None = None,
-        model: str | None = None,
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
-        cache_creation_tokens: int | None = None,
-        cache_read_tokens: int | None = None,
     ) -> list[Widget]:
         """Create widgets for a user message (without mounting)."""
         widgets: list[Widget] = []
-        msg = ChatMessage(
-            text,
-            is_agent=is_agent,
-            timestamp=timestamp,
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_creation_tokens=cache_creation_tokens,
-            cache_read_tokens=cache_read_tokens,
-        )
+        msg = ChatMessage(text, is_agent=is_agent, timestamp=timestamp)
         msg.add_class("agent-message" if is_agent else "user-message")
         widgets.append(msg)
 
@@ -312,12 +273,7 @@ class ChatView(AutoHideScroll):
         content: AssistantContent,
         tool_index: int,
         collapse_threshold: int,
-        timestamp: str | None = None,
-        model: str | None = None,
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
-        cache_creation_tokens: int | None = None,
-        cache_read_tokens: int | None = None,
+        metadata: Any = None,
     ) -> tuple[list[Widget], int]:
         """Create widgets for an assistant message (without mounting).
 
@@ -333,15 +289,20 @@ class ChatView(AutoHideScroll):
 
         for block in content.blocks:
             if isinstance(block, TextBlock):
-                msg = ChatMessage(
-                    block.text,
-                    timestamp=timestamp if not metadata_added else None,
-                    model=model if not metadata_added else None,
-                    input_tokens=input_tokens if not metadata_added else None,
-                    output_tokens=output_tokens if not metadata_added else None,
-                    cache_creation_tokens=cache_creation_tokens if not metadata_added else None,
-                    cache_read_tokens=cache_read_tokens if not metadata_added else None,
-                )
+                if not metadata_added and metadata:
+                    msg = ChatMessage(
+                        block.text,
+                        timestamp=metadata.timestamp,
+                        model=getattr(metadata, "model", None),
+                        input_tokens=metadata.input_tokens,
+                        output_tokens=metadata.output_tokens,
+                        cache_creation_tokens=metadata.cache_creation_tokens,
+                        cache_read_tokens=metadata.cache_read_tokens,
+                        duration_ms=metadata.duration_ms,
+                        cost_usd=metadata.cost_usd,
+                    )
+                else:
+                    msg = ChatMessage(block.text)
                 msg.add_class("assistant-message")
                 widgets.append(msg)
                 metadata_added = True
@@ -412,7 +373,15 @@ class ChatView(AutoHideScroll):
             self._needs_rerender = True
             return
         formatted_text, is_agent = format_agent_prompt(text)
-        self._mount_user_message(formatted_text, images, is_agent=is_agent)
+        # Get timestamp from the most recent user ChatItem
+        timestamp = None
+        if self._agent and self._agent.messages:
+            last = self._agent.messages[-1]
+            if last.role == "user" and last.metadata:
+                timestamp = last.metadata.timestamp
+        self._mount_user_message(
+            formatted_text, images, is_agent=is_agent, timestamp=timestamp
+        )
         self.scroll_if_tailing()
 
     def start_response(self) -> None:
@@ -426,12 +395,41 @@ class ChatView(AutoHideScroll):
             self.mount(self._thinking_indicator)
             self.scroll_if_tailing()
 
-    def end_response(self) -> None:
-        """Clean up at end of response."""
+    def end_response(self, result: Any = None) -> None:
+        """Clean up at end of response, optionally updating metadata with token usage.
+
+        Args:
+            result: Optional ResultMessage with usage/duration/cost data.
+        """
         if self.is_hidden:
             self._needs_rerender = True
             return
         self._hide_thinking()
+        # Update the current response's metadata header with token usage + model
+        if self._current_response and result:
+            from claudechic.widgets.content.message import MessageMetadataHeader
+
+            meta_widget = self._current_response.query_one_optional(
+                "MessageMetadataHeader", MessageMetadataHeader
+            )
+            if meta_widget:
+                usage = getattr(result, "usage", None) or {}
+                # Get model from the last assistant ChatItem metadata
+                model = None
+                if self._agent and self._agent.messages:
+                    for item in reversed(self._agent.messages):
+                        if item.role == "assistant" and item.metadata:
+                            model = item.metadata.model
+                            break
+                meta_widget.update_metadata(
+                    model=model,
+                    input_tokens=usage.get("input_tokens"),
+                    output_tokens=usage.get("output_tokens"),
+                    cache_creation_tokens=usage.get("cache_creation_input_tokens"),
+                    cache_read_tokens=usage.get("cache_read_input_tokens"),
+                    duration_ms=getattr(result, "duration_ms", None),
+                    cost_usd=getattr(result, "total_cost_usd", None),
+                )
         self._current_response = None
 
     def append_text(
@@ -459,7 +457,14 @@ class ChatView(AutoHideScroll):
 
         # Create new message widget if needed
         if new_message or not self._current_response:
-            self._current_response = ChatMessage("")
+            # Get timestamp from the most recent assistant ChatItem
+            timestamp = None
+            if self._agent and self._agent.messages:
+                for item in reversed(self._agent.messages):
+                    if item.role == "assistant" and item.metadata:
+                        timestamp = item.metadata.timestamp
+                        break
+            self._current_response = ChatMessage("", timestamp=timestamp)
             self._current_response.add_class("assistant-message")
             self.mount(self._current_response)
 
@@ -574,10 +579,16 @@ class ChatView(AutoHideScroll):
     # -----------------------------------------------------------------------
 
     def _mount_user_message(
-        self, text: str, images: list[ImageAttachment], is_agent: bool = False
+        self,
+        text: str,
+        images: list[ImageAttachment],
+        is_agent: bool = False,
+        timestamp: str | None = None,
     ) -> None:
         """Mount a user message widget with optional image attachments."""
-        for widget in self._create_user_widgets(text, images, is_agent):
+        for widget in self._create_user_widgets(
+            text, images, is_agent, timestamp=timestamp
+        ):
             self.mount(widget)
 
     def _hide_thinking(self) -> None:

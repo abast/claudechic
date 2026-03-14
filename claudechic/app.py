@@ -1324,10 +1324,11 @@ class ChatApp(App):
             agent.session_id = event.result.session_id
             self.refresh_context()
         if chat_view:
-            # End response via ChatView (hides thinking, flushes content)
-            chat_view.end_response()
-            # Flush any pending debounced content and mark summary
+            # Save reference before end_response clears it
             current = chat_view._current_response
+            # End response via ChatView (hides thinking, updates metadata, clears ref)
+            chat_view.end_response(event.result)
+            # Flush any pending debounced content and mark summary
             if current:
                 current.flush()
                 if agent and agent.response_had_tools:
