@@ -233,7 +233,12 @@ class ChatView(AutoHideScroll):
             # User message
             text, is_agent = format_agent_prompt(user_content.text)
             widgets.extend(
-                self._create_user_widgets(text, user_content.images, is_agent)
+                self._create_user_widgets(
+                    text,
+                    user_content.images,
+                    is_agent,
+                    timestamp=user_content.metadata.timestamp if user_content.metadata else None,
+                )
             )
             # Assistant response (collapse all tools, ignore returned tool_index)
             new_widgets, _ = self._create_assistant_widgets(
