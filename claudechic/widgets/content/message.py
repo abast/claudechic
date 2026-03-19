@@ -154,8 +154,11 @@ class MessageMetadataHeader(Static):
         cache_read_tokens: int | None = None,
         duration_ms: int | None = None,
         cost_usd: float | None = None,
+        timestamp: str | None = None,
     ) -> None:
-        """Update token usage, model, and duration after response completes."""
+        """Update token usage, model, duration, and timestamp after response completes."""
+        if timestamp is not None:
+            self.timestamp = timestamp
         if model is not None:
             self.model = model
         if input_tokens is not None:
