@@ -419,15 +419,18 @@ class ChatView(AutoHideScroll):
             )
             if meta_widget:
                 usage = getattr(result, "usage", None) or {}
-                # Get model from the last assistant ChatItem metadata
+                # Get model and timestamp from the last assistant ChatItem metadata
                 model = None
+                timestamp = None
                 if self._agent and self._agent.messages:
                     for item in reversed(self._agent.messages):
                         if item.role == "assistant" and item.metadata:
                             model = item.metadata.model
+                            timestamp = item.metadata.timestamp
                             break
                 meta_widget.update_metadata(
                     model=model,
+                    timestamp=timestamp,
                     input_tokens=usage.get("input_tokens"),
                     output_tokens=usage.get("output_tokens"),
                     cache_creation_tokens=usage.get("cache_creation_input_tokens"),
