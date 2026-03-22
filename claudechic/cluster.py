@@ -297,6 +297,11 @@ def _submit_job(
     stderr_path: str = "",
 ) -> dict[str, Any]:
     """Build bsub invocation, submit, and return ``{job_id, message}``."""
+    # Auto-inject --no-capture-output into conda run so Python output
+    # streams live to LSF log files instead of being buffered until exit.
+    if "conda run" in command and "--no-capture-output" not in command:
+        command = re.sub(r"\bconda run\b", "conda run --no-capture-output", command)
+
     # Build environment-variable prefix
     env_parts = [PYTHONUNBUFFERED_VAR]
     conda_envs = _get_conda_envs_dirs()
@@ -511,7 +516,9 @@ async def cluster_status(args: dict[str, Any]) -> dict[str, Any]:
     (
         "Submit a job to the LSF cluster. "
         "PYTHONUNBUFFERED=1 is always prepended. "
-        "CONDA_ENVS_DIRS is set automatically when the command contains 'conda run'."
+        "CONDA_ENVS_DIRS is set automatically when the command contains 'conda run'. "
+        "--no-capture-output is automatically injected into 'conda run' so that "
+        "Python output streams live to LSF log files instead of being buffered."
     ),
     {
         "queue": str,
