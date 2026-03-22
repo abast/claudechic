@@ -233,8 +233,14 @@ class AgentManager:
         was_active = agent_id == self.active_id
         message_count = len(agent.messages)
 
-        # Disconnect
-        await agent.disconnect()
+        # Disconnect — wrap in try/except so a single agent's disconnect
+        # failure doesn't prevent cleanup of subsequent agents in a batch.
+        try:
+            await asyncio.wait_for(agent.disconnect(), timeout=10.0)
+        except asyncio.TimeoutError:
+            log.warning(f"Disconnect timed out for agent '{name}' (id={agent_id})")
+        except Exception as e:
+            log.warning(f"Disconnect failed for agent '{name}': {e}")
         log.info(f"Closed agent '{name}' (id={agent_id})")
 
         if self.manager_observer:

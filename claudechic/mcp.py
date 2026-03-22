@@ -12,6 +12,7 @@ Exposes tools for Claude to manage agents within claudechic:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -475,7 +476,13 @@ def _close_worktree_agent(agent: Any) -> None:
     {"name": str},
 )
 async def close_agent(args: dict[str, Any]) -> dict[str, Any]:
-    """Close an agent."""
+    """Close an agent.
+
+    Schedules the close and waits for the agent to actually be removed
+    from the agent manager before returning. This prevents the caller
+    from firing multiple close_agent calls that all see stale agent
+    counts and race with each other.
+    """
     try:
         if _app is None or _app.agent_mgr is None:
             return _error_response("App not initialized")
@@ -495,6 +502,14 @@ async def close_agent(args: dict[str, Any]) -> dict[str, Any]:
 
         # Use app's close method which handles UI cleanup
         _app._do_close_agent(agent_id)
+
+        # Wait for the agent to actually be removed from the manager
+        # before returning. This serializes concurrent close_agent calls
+        # from the same caller so each one sees accurate agent counts.
+        for _ in range(50):  # up to 5 seconds
+            if agent_id not in _app.agent_mgr.agents:
+                break
+            await asyncio.sleep(0.1)
 
         return _text_response(f"Closed agent '{agent_name}'")
     except Exception as e:
