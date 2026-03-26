@@ -2197,9 +2197,15 @@ class ChatApp(App):
 
         self._do_close_agent(agent_to_close.id)
 
-    @work(group="close_agent", exclusive=True, exit_on_error=False)
+    @work(group="close_agent", exclusive=False, exit_on_error=False)
     async def _do_close_agent(self, agent_id: str) -> None:
-        """Actually close an agent (async for client cleanup)."""
+        """Actually close an agent (async for client cleanup).
+
+        Uses exclusive=False so that closing multiple agents concurrently
+        doesn't cancel in-progress close operations (which leaves agents
+        half-destroyed — chat view popped but not removed, SDK client
+        not disconnected, etc.).
+        """
         if self.agent_mgr is None:
             return
         agent = self.agents.get(agent_id)
@@ -2211,12 +2217,18 @@ class ChatApp(App):
         # Remove chat view before closing (AgentManager.close removes from agents dict)
         chat_view = self._chat_views.pop(agent_id, None)
         if chat_view:
-            await chat_view.remove()
+            try:
+                await chat_view.remove()
+            except Exception as e:
+                log.warning("Failed to remove chat view for '%s': %s", agent_name, e)
         self._active_prompts.pop(agent_id, None)
 
         # Close via AgentManager (handles disconnect, removes from agents dict,
         # triggers on_agent_closed, and switches to another agent if needed)
-        await self.agent_mgr.close(agent_id)
+        try:
+            await self.agent_mgr.close(agent_id)
+        except Exception as e:
+            log.warning("Failed to close agent '%s': %s", agent_name, e)
 
         self.notify(f"Agent '{agent_name}' closed")
 
@@ -2335,12 +2347,29 @@ class ChatApp(App):
             log.exception(f"Failed to create agent UI: {e}")
 
     def on_agent_switched(self, new_agent: Agent, old_agent: Agent | None) -> None:
-        """Handle agent switch from AgentManager."""
+        """Handle agent switch from AgentManager.
+
+        Guards against concurrent agent closures: when multiple agents are
+        being closed simultaneously, this callback may fire with agents
+        whose chat views have already been removed from the DOM.
+        """
         log.info(f"Switched to agent: {new_agent.name}")
+
+        # Guard: if the new agent's chat view was already removed (agent
+        # is being closed concurrently), skip the switch entirely.
+        if new_agent.id not in self._chat_views:
+            log.warning(
+                "on_agent_switched: new agent '%s' has no chat view (concurrent close?), skipping",
+                new_agent.name,
+            )
+            return
 
         # Use update=False to defer CSS recalculation, refresh_css at end
         if old_agent:
-            old_agent.pending_input = self.chat_input.text
+            try:
+                old_agent.pending_input = self.chat_input.text
+            except Exception:
+                pass  # chat_input may be in a bad state during mass closure
             old_chat_view = self._chat_views.get(old_agent.id)
             if old_chat_view:
                 old_chat_view.add_class("hidden", update=False)

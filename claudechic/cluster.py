@@ -203,7 +203,10 @@ def _collapse_lsf_lines(output: str) -> str:
     for line in lines:
         leading = len(line) - len(line.lstrip(" "))
         if leading >= _LSF_CONTINUATION_MIN_INDENT and collapsed:
-            collapsed[-1] += line.strip()
+            # Only strip leading indentation — NOT trailing whitespace.
+            # Trailing spaces mark word-boundary wraps (e.g. "conda run " +
+            # "--no-capture-output"); stripping them merges words incorrectly.
+            collapsed[-1] += line.lstrip(" ")
         else:
             collapsed.append(line)
     return "\n".join(collapsed)
@@ -297,18 +300,35 @@ def _submit_job(
     stderr_path: str = "",
 ) -> dict[str, Any]:
     """Build bsub invocation, submit, and return ``{job_id, message}``."""
-    # Auto-inject --no-capture-output into conda run so Python output
-    # streams live to LSF log files instead of being buffered until exit.
+    # Inject conda-run helpers so Python output streams live to LSF log files.
+    #
+    # Order of injections (both applied before conda run, not at command start):
+    #   1. --no-capture-output  — tells conda not to buffer the subprocess streams.
+    #   2. PYTHONUNBUFFERED=1   — injected as an inline env-var right before
+    #      'conda run' so it reaches the Python process.  Placing it at the
+    #      very start of the command (before 'cd …') only sets it for 'cd',
+    #      not for the conda run invocation after '&&'.
+    #
+    # Both injections are idempotent (only applied if not already present).
     if "conda run" in command and "--no-capture-output" not in command:
         command = re.sub(r"\bconda run\b", "conda run --no-capture-output", command)
 
-    # Build environment-variable prefix
-    env_parts = [PYTHONUNBUFFERED_VAR]
+    if "conda run" in command and "PYTHONUNBUFFERED" not in command:
+        command = re.sub(r"\bconda run\b", f"{PYTHONUNBUFFERED_VAR} conda run", command)
+
+    # Build environment-variable prefix (non-conda commands / CONDA_ENVS_DIRS)
+    env_parts: list[str] = []
     conda_envs = _get_conda_envs_dirs()
     if conda_envs and "conda run" in command:
         env_parts.append(f"CONDA_ENVS_DIRS={conda_envs}")
-    env_prefix = " ".join(env_parts)
-    full_command = f"{env_prefix} {command}"
+    if env_parts:
+        full_command = f"{' '.join(env_parts)} {command}"
+    else:
+        # No conda: still prepend PYTHONUNBUFFERED for bare python commands
+        if "conda run" not in command:
+            full_command = f"{PYTHONUNBUFFERED_VAR} {command}"
+        else:
+            full_command = command
 
     # Build bsub invocation
     parts: list[str] = ["bsub"]
