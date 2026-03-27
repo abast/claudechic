@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any, Callable
 
 from claude_agent_sdk import tool
@@ -228,6 +229,9 @@ def _parse_bjobs_detail(output: str, job_id: str) -> dict[str, Any]:
     submit_time = _first(
         r"(\w{3} \w{3} \s*\d+ \d+:\d+:\d+ \d+):\s+Submitted"
     )
+    stdout_path = _first(r"Output File <([^>]+)>")
+    stderr_path = _first(r"Error File <([^>]+)>")
+    execution_cwd = _first(r"Execution CWD <([^>]+)>")
 
     cpu_time_seconds: int | None = None
     cpu_m = re.search(r"CPU time used is ([\d.]+) seconds", text)
@@ -261,6 +265,9 @@ def _parse_bjobs_detail(output: str, job_id: str) -> dict[str, Any]:
         "max_mem_gb": max_mem_gb,
         "run_limit_min": run_limit_min,
         "command": command,
+        "stdout_path": stdout_path,
+        "stderr_path": stderr_path,
+        "execution_cwd": execution_cwd,
     }
 
 
@@ -300,6 +307,12 @@ def _submit_job(
     stderr_path: str = "",
 ) -> dict[str, Any]:
     """Build bsub invocation, submit, and return ``{job_id, message}``."""
+    # Auto-create log dir if needed (so agents never need mkdir before cluster_submit).
+    # NFS is shared across all nodes, so local mkdir is visible on cluster nodes.
+    for log_path in [stdout_path, stderr_path]:
+        if log_path:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+
     # Inject conda-run helpers so Python output streams live to LSF log files.
     #
     # Order of injections (both applied before conda run, not at command start):
@@ -378,6 +391,84 @@ def _kill_job(job_id: str) -> dict[str, Any]:
         "success": True,
         "message": stdout.strip() or f"Job {job_id} signal sent.",
     }
+
+
+def _resolve_log_path(log_path: str, execution_cwd: str | None) -> Path:
+    """Resolve a log file path, expanding ``$HOME`` and relative paths.
+
+    LSF ``bjobs -l`` reports log paths either as absolute or relative to the
+    submission CWD.  The CWD itself may contain ``$HOME`` which needs
+    expanding.  This function handles all three cases.
+    """
+    expanded = os.path.expandvars(log_path)
+    p = Path(expanded)
+    if p.is_absolute():
+        return p
+    if execution_cwd:
+        cwd_expanded = os.path.expandvars(execution_cwd)
+        return Path(cwd_expanded) / p
+    return p
+
+
+def _read_tail(path: Path, tail: int) -> str | None:
+    """Read the last *tail* lines of a file, or all lines if *tail* is 0.
+
+    Returns ``None`` if the file does not exist or cannot be read.
+    """
+    try:
+        with open(path) as f:
+            if tail <= 0:
+                return f.read()
+            lines = f.readlines()
+            return "".join(lines[-tail:])
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def _get_job_logs(job_id: str, tail: int = 100) -> dict[str, Any]:
+    """Read stdout/stderr log files for an LSF job.
+
+    Extracts log paths from ``bjobs -l`` output, resolves them against
+    the execution CWD, and reads the files locally (NFS-shared filesystem).
+
+    Args:
+        job_id: LSF job ID.
+        tail: Number of lines from end of each log file (0 = full file).
+
+    Returns:
+        Dict with keys: ``job_id``, ``stdout``, ``stderr``, ``log_paths``,
+        ``found``.  ``found`` is True if at least one log file was readable.
+    """
+    detail = _get_job_status(job_id)
+    stdout_log_path = detail.get("stdout_path")
+    stderr_log_path = detail.get("stderr_path")
+    execution_cwd = detail.get("execution_cwd")
+
+    result: dict[str, Any] = {
+        "job_id": job_id,
+        "stdout": "",
+        "stderr": "",
+        "log_paths": {"stdout": stdout_log_path, "stderr": stderr_log_path},
+        "found": False,
+    }
+
+    if stdout_log_path:
+        resolved = _resolve_log_path(stdout_log_path, execution_cwd)
+        content = _read_tail(resolved, tail)
+        if content is not None:
+            result["stdout"] = content
+            result["found"] = True
+            result["log_paths"]["stdout"] = str(resolved)
+
+    if stderr_log_path:
+        resolved = _resolve_log_path(stderr_log_path, execution_cwd)
+        content = _read_tail(resolved, tail)
+        if content is not None:
+            result["stderr"] = content
+            result["found"] = True
+            result["log_paths"]["stderr"] = str(resolved)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +671,26 @@ async def cluster_kill(args: dict[str, Any]) -> dict[str, Any]:
     job_id = args["job_id"]
     try:
         result = await asyncio.to_thread(_kill_job, job_id)
+        return _json_response(result)
+    except Exception as e:
+        return _error_response(str(e))
+
+
+@tool(
+    "cluster_logs",
+    (
+        "Read stdout/stderr log files for an LSF cluster job. "
+        "Returns the last `tail` lines of each log file (default 100; 0 = full log). "
+        "Log paths are extracted from bjobs and read locally via NFS."
+    ),
+    {"job_id": str, "tail": int},
+)
+async def cluster_logs(args: dict[str, Any]) -> dict[str, Any]:
+    """Read job log files."""
+    job_id = args["job_id"]
+    tail = args.get("tail", 100)
+    try:
+        result = await asyncio.to_thread(_get_job_logs, job_id, tail)
         return _json_response(result)
     except Exception as e:
         return _error_response(str(e))

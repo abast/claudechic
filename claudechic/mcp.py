@@ -551,6 +551,7 @@ def create_chic_server(caller_name: str | None = None):
     from claudechic.cluster import (
         cluster_jobs,
         cluster_kill,
+        cluster_logs,
         cluster_status,
         cluster_submit,
         _make_cluster_watch,
@@ -561,6 +562,7 @@ def create_chic_server(caller_name: str | None = None):
         cluster_status,
         cluster_submit,
         cluster_kill,
+        cluster_logs,
         _make_cluster_watch(
             caller_name=caller_name,
             send_notification=_send_prompt_fire_and_forget,
