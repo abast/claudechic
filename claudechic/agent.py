@@ -733,7 +733,14 @@ Key Rules:
 
             # Update permission mode based on plan mode tools
             if tool.name == ToolName.EXIT_PLAN_MODE and not tool.is_error:
-                self._set_permission_mode_local("default")
+                # Only reset if still in plan mode — the permission handler
+                # (_handle_exit_plan_mode_permission) may have already set a
+                # different mode (e.g. "acceptEdits").  Unconditionally
+                # resetting to "default" here would clobber that choice and
+                # desync local state from the SDK, causing timeouts on the
+                # next set_permission_mode call.
+                if self.permission_mode == "plan":
+                    self._set_permission_mode_local("default")
             elif tool.name == ToolName.ENTER_PLAN_MODE and not tool.is_error:
                 self._set_permission_mode_local("plan")
                 # Fetch plan path asynchronously (needed for ExitPlanMode later)
