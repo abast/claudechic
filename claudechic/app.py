@@ -2360,9 +2360,12 @@ class ChatApp(App):
 
         self._do_close_agent(agent_to_close.id)
 
-    @work(group="close_agent", exclusive=True, exit_on_error=False)
-    async def _do_close_agent(self, agent_id: str) -> None:
-        """Actually close an agent (async for client cleanup)."""
+    async def _close_agent_core(self, agent_id: str) -> None:
+        """Core agent close logic — awaitable, no @work wrapper.
+
+        Called directly by MCP close_agent (needs synchronous completion to
+        avoid race conditions) and by the @work wrapper below for UI callers.
+        """
         if self.agent_mgr is None:
             return
         agent = self.agents.get(agent_id)
@@ -2382,6 +2385,11 @@ class ChatApp(App):
         await self.agent_mgr.close(agent_id)
 
         self.notify(f"Agent '{agent_name}' closed")
+
+    @work(group="close_agent", exclusive=True, exit_on_error=False)
+    async def _do_close_agent(self, agent_id: str) -> None:
+        """Close an agent via Textual worker (fire-and-forget for UI callers)."""
+        await self._close_agent_core(agent_id)
 
     def on_app_focus(self) -> None:
         if self._chat_input:

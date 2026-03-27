@@ -158,7 +158,8 @@ def _make_spawn_agent(caller_name: str | None = None):
 
         try:
             # Create agent via AgentManager (handles SDK connection)
-            agent = await _app.agent_mgr.create(name=name, cwd=path, switch_to=False)
+            # Hardcode opus for subagents spawned via MCP
+            agent = await _app.agent_mgr.create(name=name, cwd=path, switch_to=False, model="opus")
         except Exception as e:
             return _error_response(f"Error creating agent: {e}")
 
@@ -433,7 +434,7 @@ async def _do_cleanup(agent: Any, info: Any) -> dict[str, Any]:
     if success:
         branch = info.branch_name
         agent.finish_state = None
-        _close_worktree_agent(agent)
+        await _close_worktree_agent(agent)
         msg = f"Successfully finished worktree '{branch}'"
         if warning:
             msg += f" ({warning})"
@@ -448,7 +449,7 @@ async def _do_cleanup(agent: Any, info: Any) -> dict[str, Any]:
     )
 
 
-def _close_worktree_agent(agent: Any) -> None:
+async def _close_worktree_agent(agent: Any) -> None:
     """Close a worktree agent after successful finish."""
     if _app is None or _app.agent_mgr is None:
         return
@@ -466,41 +467,53 @@ def _close_worktree_agent(agent: Any) -> None:
         if main:
             _app.agent_mgr.switch(main.id)
 
-    _app._do_close_agent(agent.id)
+    # Await directly to ensure agent is fully closed before returning
+    await _app._close_agent_core(agent.id)
 
 
-@tool(
-    "close_agent",
-    "Close an agent by name. Cannot close the last remaining agent.",
-    {"name": str},
-)
-async def close_agent(args: dict[str, Any]) -> dict[str, Any]:
-    """Close an agent."""
-    try:
-        if _app is None or _app.agent_mgr is None:
-            return _error_response("App not initialized")
+def _make_close_agent(caller_name: str | None = None):
+    """Create close_agent tool with caller name bound for safety checks."""
 
-        name = args["name"]
+    @tool(
+        "close_agent",
+        "Close an agent by name. Cannot close the last remaining agent or the calling agent.",
+        {"name": str},
+    )
+    async def close_agent(args: dict[str, Any]) -> dict[str, Any]:
+        """Close an agent."""
+        try:
+            if _app is None or _app.agent_mgr is None:
+                return _error_response("App not initialized")
 
-        # Can't close the last agent
-        if len(_app.agent_mgr) <= 1:
-            return _error_response("Cannot close the last agent")
+            name = args["name"]
 
-        agent, error = _find_agent_by_name(name)
-        if agent is None:
-            return _error_response(error or "Agent not found")
+            # Can't close yourself
+            if caller_name and name == caller_name:
+                return _error_response("An agent cannot close itself")
 
-        agent_id = agent.id
-        agent_name = agent.name
+            # Can't close the last agent
+            if len(_app.agent_mgr) <= 1:
+                return _error_response("Cannot close the last agent")
 
-        # Use app's close method which handles UI cleanup
-        _app._do_close_agent(agent_id)
+            agent, error = _find_agent_by_name(name)
+            if agent is None:
+                return _error_response(error or "Agent not found")
 
-        return _text_response(f"Closed agent '{agent_name}'")
-    except Exception as e:
-        agent_name = args.get("name", "unknown") if args else "unknown"
-        log.exception(f"close_agent failed for '{agent_name}'")
-        return _error_response(f"Failed to close agent '{agent_name}': {e}")
+            agent_id = agent.id
+            agent_name = agent.name
+
+            # Await the close directly so the agent count is accurate
+            # before this tool returns (prevents race conditions with
+            # rapid successive close calls).
+            await _app._close_agent_core(agent_id)
+
+            return _text_response(f"Closed agent '{agent_name}'")
+        except Exception as e:
+            agent_name = args.get("name", "unknown") if args else "unknown"
+            log.exception(f"close_agent failed for '{agent_name}'")
+            return _error_response(f"Failed to close agent '{agent_name}': {e}")
+
+    return close_agent
 
 
 def create_chic_server(caller_name: str | None = None):
@@ -517,7 +530,7 @@ def create_chic_server(caller_name: str | None = None):
         _make_tell_agent(caller_name),
         _make_whoami(caller_name),
         list_agents,
-        close_agent,
+        _make_close_agent(caller_name),
     ]
 
     # finish_worktree is experimental - enable with experimental.finish_worktree: true
