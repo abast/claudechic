@@ -2978,6 +2978,10 @@ class ChatApp(App):
             )
         )
 
+        # Determine what mode to restore when exiting plan mode.
+        # The agent remembers what mode it had before entering plan mode.
+        restore_mode = agent._pre_plan_permission_mode
+
         if choice == "clear_auto":
             # Execute plan in fresh session immediately
             agent.pending_plan_execution = {
@@ -2988,11 +2992,26 @@ class ChatApp(App):
             self._execute_plan_fresh(agent)
             return PermissionResponse(PermissionChoice.DENY)
         elif choice == "auto":
-            await agent.set_permission_mode("acceptEdits")
+            # Set local state immediately; defer the SDK call to avoid
+            # deadlock (we're inside the SDK's permission callback — calling
+            # client.set_permission_mode here would block because the SDK is
+            # waiting for this callback to return first).
+            agent._set_permission_mode_local("acceptEdits")
+            create_safe_task(
+                agent._sync_permission_mode_to_sdk("acceptEdits"),
+                name="deferred-permission-mode-acceptEdits",
+            )
             self.notify("Auto-edit enabled (Shift+Tab to disable)")
             return PermissionResponse(PermissionChoice.ALLOW)
         elif choice == "manual":
-            await agent.set_permission_mode("default")
+            agent._set_permission_mode_local(restore_mode)
+            # Sync to SDK if restore_mode differs from "default" (which
+            # ExitPlanMode already sets on the SDK side).
+            if restore_mode != "default":
+                create_safe_task(
+                    agent._sync_permission_mode_to_sdk(restore_mode),
+                    name="deferred-permission-mode-restore",
+                )
             return PermissionResponse(PermissionChoice.ALLOW)
         else:
             # Check for feedback in "deny:feedback" format
