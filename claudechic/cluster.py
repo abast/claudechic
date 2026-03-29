@@ -343,6 +343,18 @@ def _submit_job(
         else:
             full_command = command
 
+    # Inject working directory: LSF defaults to the user's home dir, not the
+    # project root.  Prepend 'cd <cwd> && ' so that relative config paths,
+    # checkpoint paths, and output dirs all resolve correctly.
+    #
+    # Injected AFTER env_parts assembly so the final shape is:
+    #   cd <cwd> && CONDA_ENVS_DIRS=... PYTHONUNBUFFERED=1 conda run ...
+    # (env var prefixes apply to conda run, not to cd — correct bash semantics)
+    #
+    # Idempotent: skipped if command already starts with 'cd '.
+    if not re.match(r"^\s*cd\s+", full_command):
+        full_command = f"cd {os.getcwd()} && {full_command}"
+
     # Build bsub invocation
     parts: list[str] = ["bsub"]
     parts += ["-q", queue]

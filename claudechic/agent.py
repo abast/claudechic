@@ -335,24 +335,44 @@ class Agent:
         raw_messages = await load_session_messages(self.session_id, cwd=cwd or self.cwd)
 
         current_assistant: AssistantContent | None = None
+        current_assistant_ts: str | None = None
+        current_assistant_model: str | None = None
 
         for m in raw_messages:
             if m["type"] == "user":
                 # Flush any pending assistant content
                 if current_assistant is not None:
                     self.messages.append(
-                        ChatItem(role="assistant", content=current_assistant)
+                        ChatItem(
+                            role="assistant",
+                            content=current_assistant,
+                            metadata=MessageMetadata(
+                                timestamp=current_assistant_ts,
+                                model=current_assistant_model,
+                            ),
+                        )
                     )
                     current_assistant = None
+                    current_assistant_ts = None
+                    current_assistant_model = None
                 # Add user message
                 self.messages.append(
-                    ChatItem(role="user", content=UserContent(text=m["content"]))
+                    ChatItem(
+                        role="user",
+                        content=UserContent(text=m["content"]),
+                        metadata=MessageMetadata(timestamp=m.get("timestamp")),
+                    )
                 )
             elif m["type"] == "assistant":
                 # Add text block to current assistant content (preserving order)
                 if current_assistant is None:
                     current_assistant = AssistantContent()
                 current_assistant.blocks.append(TextBlock(text=m["content"]))
+                # Track metadata from the latest block
+                if m.get("timestamp"):
+                    current_assistant_ts = m["timestamp"]
+                if m.get("model"):
+                    current_assistant_model = m["model"]
             elif m["type"] == "tool_use":
                 # Add tool use to current assistant content (preserving order)
                 if current_assistant is None:
@@ -367,7 +387,16 @@ class Agent:
 
         # Flush final assistant content
         if current_assistant is not None:
-            self.messages.append(ChatItem(role="assistant", content=current_assistant))
+            self.messages.append(
+                ChatItem(
+                    role="assistant",
+                    content=current_assistant,
+                    metadata=MessageMetadata(
+                        timestamp=current_assistant_ts,
+                        model=current_assistant_model,
+                    ),
+                )
+            )
 
         log.info(f"Loaded {len(self.messages)} messages from session {self.session_id}")
 

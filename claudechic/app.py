@@ -623,6 +623,7 @@ class ChatApp(App):
         resume: str | None = None,
         agent_name: str | None = None,
         model: str | None = None,
+        agent_type: str | None = None,
     ) -> ClaudeAgentOptions:
         """Create SDK options with common settings.
 
@@ -640,6 +641,11 @@ class ChatApp(App):
         # Expose agent name so guardrail hooks can identify the Coordinator vs sub-agents
         if agent_name:
             env["CLAUDE_AGENT_NAME"] = agent_name
+        # Expose app PID so team-mode guardrails can create session-scoped markers
+        env["CLAUDECHIC_APP_PID"] = str(os.getpid())
+        # Expose agent role type so guardrail hooks can enforce role-based permissions
+        if agent_type:
+            env["CLAUDE_AGENT_ROLE"] = agent_type
 
         # Use global permission mode from AgentManager (runtime source of truth)
         # CLI flag --yolo sets global_permission_mode at init, no special handling needed here

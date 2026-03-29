@@ -136,7 +136,7 @@ def _make_spawn_agent(caller_name: str | None = None):
     @tool(
         "spawn_agent",
         "Create a new Claude agent in claudechic. The agent gets its own chat view and can work independently.",
-        {"name": str, "path": str, "prompt": str, "model": str},
+        {"name": str, "path": str, "prompt": str, "model": str, "type": str},
     )
     async def spawn_agent(args: dict[str, Any]) -> dict[str, Any]:
         """Spawn a new agent, optionally with an initial prompt."""
@@ -149,6 +149,7 @@ def _make_spawn_agent(caller_name: str | None = None):
         default_cwd = _app.agent_mgr.active.cwd if _app.agent_mgr.active else Path.cwd()
         path = Path(args.get("path", str(default_cwd))).resolve()
         prompt = args.get("prompt")
+        agent_type = args.get("type")
 
         # Inherit caller's model if not explicitly specified
         caller_model = None
@@ -167,7 +168,10 @@ def _make_spawn_agent(caller_name: str | None = None):
 
         try:
             # Create agent via AgentManager (handles SDK connection)
-            agent = await _app.agent_mgr.create(name=name, cwd=path, switch_to=False, model=model)
+            agent = await _app.agent_mgr.create(
+                name=name, cwd=path, switch_to=False, model=model,
+                agent_type=agent_type,
+            )
         except Exception as e:
             return _error_response(f"Error creating agent: {e}")
 
