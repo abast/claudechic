@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from claude_agent_sdk import (
     AssistantMessage,
+    CLIJSONDecodeError,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
@@ -197,8 +198,11 @@ class Agent:
         self.file_index: FileIndex | None = None
         self.todos: list[dict] = []
         self.permission_mode: str = "default"  # default, acceptEdits, plan
+        self._pre_plan_permission_mode: str = "default"  # mode before entering plan
         self.session_allowed_tools: set[str] = set()  # Tools allowed for this session
         self._pending_followup: str | None = None  # Auto-send after current response
+        self._pending_reply_to: str | None = None  # Agent name we owe a reply to
+        self._reply_nudge_count: int = 0  # How many nudges sent for current obligation
         self.model: str | None = "opus"  # Model override (None = SDK default)
 
         # Worktree finish state (for /worktree finish flow)
@@ -591,6 +595,15 @@ Key Rules:
 
         except asyncio.CancelledError:
             raise
+        except CLIJSONDecodeError as e:
+            # Feed the error back to the agent so it can recover.
+            log.warning("CLIJSONDecodeError: %s", e)
+            if self.observer:
+                self.observer.on_error(self, str(e), e)
+            create_safe_task(
+                self._send_followup(f"Error: {e}"), name="json-decode-retry"
+            )
+            return
         except Exception as e:
             # Check if this is a connection error (SDK process died)
             # Be specific: only actual connection failures, not API errors mentioning "connection"
@@ -843,8 +856,15 @@ Key Rules:
 
             # Update permission mode based on plan mode tools
             if tool.name == ToolName.EXIT_PLAN_MODE and not tool.is_error:
-                self._set_permission_mode_local("default")
+                # Only reset if still in plan mode — the permission handler
+                # (_handle_exit_plan_mode_permission) may have already set a
+                # different mode (e.g. "acceptEdits").  Unconditionally
+                # resetting here would clobber that choice and desync local
+                # state from the SDK.
+                if self.permission_mode == "plan":
+                    self._set_permission_mode_local(self._pre_plan_permission_mode)
             elif tool.name == ToolName.ENTER_PLAN_MODE and not tool.is_error:
+                self._pre_plan_permission_mode = self.permission_mode
                 self._set_permission_mode_local("plan")
                 # Fetch plan path asynchronously (needed for ExitPlanMode later)
                 create_safe_task(self.ensure_plan_path(), name="fetch-plan-path")
@@ -1013,6 +1033,21 @@ Key Rules:
             self.permission_mode = mode
             if self.observer:
                 self.observer.on_permission_mode_changed(self)
+
+    async def _sync_permission_mode_to_sdk(self, mode: str) -> None:
+        """Send permission mode to SDK without changing local state.
+
+        Use this when local state was already set via ``_set_permission_mode_local``
+        but the SDK still needs to be notified.
+
+        Because this runs as a deferred task (via ``create_safe_task``), the
+        local state may have changed between scheduling and execution.  If so,
+        skip the SDK call — whoever changed the mode is responsible for syncing.
+        """
+        if self.permission_mode != mode:
+            return  # Local state changed since we were scheduled; skip
+        if self.client and self.session_id:
+            await self.client.set_permission_mode(mode)
 
     async def ensure_plan_path(self) -> None:
         """Fetch and cache the plan path for this session (if not already set)."""
