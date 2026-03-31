@@ -84,6 +84,7 @@ COMMANDS: list[tuple[str, str, list[str]]] = [
     ("/clearui", "Clear UI widgets (keeps history)", []),
     ("/diff", "Review changes vs target (default HEAD)", []),
     ("/resume", "Resume a previous session", []),
+    ("/resume_topology", "Resume a multi-agent session", []),
     (
         "/worktree",
         "Create git worktree with agent",
@@ -184,6 +185,10 @@ def handle_command(app: "ChatApp", prompt: str) -> bool:
     if cmd.startswith("/clearui"):
         _track_command(app, "clearui")
         return _handle_clearui(app, cmd)
+
+    if cmd.startswith("/resume_topology"):
+        _track_command(app, "resume_topology")
+        return _handle_resume_topology(app, cmd)
 
     if cmd.startswith("/resume"):
         _track_command(app, "resume")
@@ -391,6 +396,12 @@ def _handle_resume(app: "ChatApp", command: str) -> bool:
         app.resume_session(session_id)
     else:
         app._show_session_picker()
+    return True
+
+
+def _handle_resume_topology(app: "ChatApp", command: str) -> bool:
+    """Handle /resume_topology command — show picker for multi-agent sessions."""
+    app._show_topology_picker()
     return True
 
 

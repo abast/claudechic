@@ -70,7 +70,7 @@ class AgentManager:
 
     def find_by_name(self, name: str) -> Agent | None:
         """Find agent by name."""
-        for agent in self.agents.values():
+        for agent in list(self.agents.values()):
             if agent.name == name:
                 return agent
         return None
@@ -349,7 +349,7 @@ class AgentManager:
         Closed entries carry ``"closed": true``; active entries omit the key.
         """
         agents_list = []
-        for agent in self.agents.values():
+        for agent in list(self.agents.values()):
             agents_list.append(
                 {
                     "name": agent.name,
@@ -374,7 +374,7 @@ class AgentManager:
             mode: One of 'default', 'acceptEdits', 'plan', 'bypassPermissions'
         """
         self.global_permission_mode = mode
-        for agent in self.agents.values():
+        for agent in list(self.agents.values()):
             await agent.set_permission_mode(mode)
         if self.manager_observer:
             self.manager_observer.on_global_permission_mode_changed(mode)

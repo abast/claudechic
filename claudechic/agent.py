@@ -383,7 +383,9 @@ class Agent:
     async def send(self, prompt: str, *, display_as: str | None = None) -> None:
         """Send a message and start processing response.
 
-        The response is processed concurrently - this method returns immediately.
+        If the agent is already processing a response, waits for it to finish
+        before sending (up to a timeout, then interrupts). This prevents two
+        tasks from competing on the SDK message stream.
 
         Args:
             prompt: The prompt to send to Claude
@@ -392,7 +394,24 @@ class Agent:
         if not self.client:
             raise RuntimeError("Agent not connected")
 
-        # Add user message to history (store display text if provided)
+        # If a response is in-flight, wait for it to finish so we don't create
+        # two competing readers on the SDK message stream.  Fall back to
+        # interrupt if the response takes too long (e.g. stuck permission, dead
+        # CLI) so inter-agent messages aren't lost indefinitely.
+        if self._response_task and not self._response_task.done():
+            log.info("Agent '%s' busy, waiting for current response before sending", self.name)
+            try:
+                await asyncio.wait_for(asyncio.shield(self._response_task), timeout=120.0)
+            except asyncio.TimeoutError:
+                log.warning("Agent '%s' response did not finish in 120s, interrupting", self.name)
+                await self.interrupt()
+            except (asyncio.CancelledError, Exception):
+                pass  # Response finished (cancelled or errored), proceed
+
+        self._start_response(prompt, display_as=display_as)
+
+    def _start_response(self, prompt: str, *, display_as: str | None = None) -> None:
+        """Actually dispatch a prompt to the SDK (must not be called while busy)."""
         display_text = display_as or prompt
         self.messages.append(
             ChatItem(
@@ -779,6 +798,13 @@ Key Rules:
         if tool_name.startswith("mcp__chic__"):
             return PermissionResultAllow()
 
+        # Auto-approve ALL tools in bypassPermissions mode.
+        # Normally the CLI handles this, but if the SDK control request to set
+        # the mode timed out, the CLI may still send permission requests.
+        if self.permission_mode == "bypassPermissions":
+            log.info(f"Auto-approved {tool_name} (bypassPermissions mode)")
+            return PermissionResultAllow()
+
         # Block mutating tools in plan mode (except writes to plan file)
         # Note: PreToolUse hook in app.py also blocks these; this is a fallback
         if self.permission_mode == "plan" and tool_name in self.PLAN_MODE_BLOCKED_TOOLS:
@@ -927,7 +953,14 @@ Key Rules:
         if self.permission_mode != mode:
             return  # Local state changed since we were scheduled; skip
         if self.client and self.session_id:
-            await self.client.set_permission_mode(mode)
+            try:
+                await self.client.set_permission_mode(mode)
+            except Exception:
+                log.warning(
+                    "Deferred sync of permission mode '%s' to SDK failed"
+                    " (control request timeout)",
+                    mode,
+                )
 
     async def ensure_plan_path(self) -> None:
         """Fetch and cache the plan path for this session (if not already set)."""
@@ -950,7 +983,14 @@ Key Rules:
                 await self.ensure_plan_path()
             # Only call SDK if connected (client exists and has active connection)
             if self.client and self.session_id:
-                await self.client.set_permission_mode(mode)
+                try:
+                    await self.client.set_permission_mode(mode)
+                except Exception:
+                    log.warning(
+                        "Failed to sync permission mode '%s' to SDK"
+                        " (control request timeout); local state updated",
+                        mode,
+                    )
             if self.observer:
                 self.observer.on_permission_mode_changed(self)
 

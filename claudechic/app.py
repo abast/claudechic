@@ -1866,6 +1866,21 @@ class ChatApp(App):
         cwd = self._agent.cwd if self._agent else None
         self.push_screen(SessionScreen(cwd=cwd), on_dismiss)
 
+    def _show_topology_picker(self) -> None:
+        """Show the topology session picker for multi-agent resume."""
+        from claudechic.screens import TopologySessionScreen
+
+        def on_dismiss(session_id: str | None) -> None:
+            if session_id:
+                log.info(f"Resuming topology session: {session_id}")
+                self.run_worker(self._load_and_display_history(session_id))
+                self.notify(f"Resuming {session_id[:8]}...")
+                self.resume_session(session_id)
+            self.chat_input.focus()
+
+        cwd = self._agent.cwd if self._agent else None
+        self.push_screen(TopologySessionScreen(cwd=cwd), on_dismiss)
+
     def _show_rewind_picker(self) -> None:
         """Show the rewind checkpoint picker screen."""
         from claudechic.screens import RewindScreen
@@ -2044,9 +2059,9 @@ class ChatApp(App):
             active_prompt.cancel()
             return
 
-        # Interrupt running agent - send interrupt to SDK
-        if self.client and self._agent and self._agent.status == "busy":
-            self.run_worker(self.client.interrupt(), exclusive=False)
+        # Interrupt running agent via Agent.interrupt() (handles errors + state)
+        if self._agent and self._agent.status == "busy":
+            self.run_worker(self._agent.interrupt(), exclusive=False)
             self._hide_thinking()
             self.notify("Interrupted")
             self.chat_input.focus()

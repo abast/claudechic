@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -351,6 +352,105 @@ async def get_context_from_session(
         return None
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Topology listing (for /resume_topology)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TopologyEntry:
+    """A multi-agent session discovered from a .topology.json file."""
+
+    session_id: str  # main agent's session ID (filename stem minus .topology)
+    title: str  # from main session .jsonl via _extract_session_info()
+    timestamp: float  # topology file mtime
+    agent_names: list[str] = field(default_factory=list)  # all agent names
+
+
+def list_topology_sessions(
+    limit: int = 20, cwd: Path | None = None
+) -> list[TopologyEntry]:
+    """List multi-agent sessions that have topology files.
+
+    Scans the project sessions directory for ``*.topology.json`` files,
+    extracts agent names, and enriches with session title from the main
+    ``.jsonl`` file.
+
+    Args:
+        limit: Maximum number of entries to return.
+        cwd: Project directory. If None, uses current working directory.
+
+    Returns:
+        List of :class:`TopologyEntry` sorted by timestamp descending.
+    """
+    sessions_dir = get_project_sessions_dir(cwd)
+    if not sessions_dir:
+        return []
+
+    entries: list[TopologyEntry] = []
+    for topo_file in sessions_dir.glob("*.topology.json"):
+        # Derive session ID: strip ".topology.json" suffix
+        stem = topo_file.name
+        if not stem.endswith(".topology.json"):
+            continue
+        session_id = stem[: -len(".topology.json")]
+
+        # Check main .jsonl exists
+        jsonl_file = sessions_dir / f"{session_id}.jsonl"
+        if not jsonl_file.exists():
+            continue
+
+        # Parse topology JSON
+        try:
+            with open(topo_file, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError, OSError) as exc:
+            log.warning("Skipping malformed topology file %s: %s", topo_file, exc)
+            continue
+
+        if not isinstance(data, dict) or "agents" not in data:
+            continue
+
+        # Extract agent names
+        agents_list = data.get("agents", [])
+        agent_names: list[str] = []
+        for agent in agents_list:
+            if isinstance(agent, dict):
+                name = agent.get("name")
+                if name:
+                    agent_names.append(name)
+
+        # Skip single-agent topologies — save_topology() is called for all
+        # sessions, so without this filter we'd show every session.
+        if len(agent_names) <= 1:
+            continue
+
+        # Extract title from main .jsonl (skip zero-message sessions)
+        title, msg_count, _last_ts = _extract_session_info(jsonl_file)
+        if msg_count == 0:
+            continue
+        title = title or session_id[:8]
+
+        # Use topology file mtime as timestamp
+        try:
+            timestamp = topo_file.stat().st_mtime
+        except OSError:
+            continue
+
+        entries.append(
+            TopologyEntry(
+                session_id=session_id,
+                title=title,
+                timestamp=timestamp,
+                agent_names=agent_names,
+            )
+        )
+
+    # Sort by timestamp descending (most recent first)
+    entries.sort(key=lambda e: e.timestamp, reverse=True)
+    return entries[:limit]
 
 
 # ---------------------------------------------------------------------------
