@@ -17,7 +17,11 @@ from claudechic.widgets.input.vi_mode import ViHandler, ViMode
 
 
 class ThinkingIndicator(Spinner):
-    """Animated spinner shown when Claude is thinking."""
+    """Animated spinner shown when Claude is thinking.
+
+    Shows elapsed time after 30 seconds so users can distinguish "stuck" from
+    "slow" and decide whether to interrupt.
+    """
 
     can_focus = False
     DEFAULT_CSS = """
@@ -27,12 +31,25 @@ class ThinkingIndicator(Spinner):
     }
     """
 
+    # Show elapsed time after this many seconds
+    _ELAPSED_THRESHOLD = 30
+
     def __init__(self, id: str | None = None, classes: str | None = None) -> None:
         super().__init__("Thinking...")
+        self._start_time: float = time.monotonic()
         if id:
             self.id = id
         if classes:
             self.set_classes(classes)
+
+    def render(self) -> str:
+        """Show elapsed time after threshold."""
+        elapsed = time.monotonic() - self._start_time
+        if elapsed >= self._ELAPSED_THRESHOLD:
+            mins, secs = divmod(int(elapsed), 60)
+            elapsed_str = f"{mins}:{secs:02d}" if mins else f"{secs}s"
+            self._text = f" Thinking... {elapsed_str}"
+        return f"{self.FRAMES[Spinner._frame]}{self._text}"
 
 
 class ConnectingIndicator(Vertical):

@@ -10,7 +10,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from claude_agent_sdk.types import HookEvent
@@ -30,6 +30,7 @@ from claude_agent_sdk import (
     CLIConnectionError,
     ClaudeSDKClient,
     ClaudeAgentOptions,
+    PermissionMode,
     SystemMessage,
     ToolUseBlock,
     ResultMessage,
@@ -41,6 +42,8 @@ from claudechic.messages import (
     ToolUseMessage,
     ToolResultMessage,
     CommandOutputMessage,
+    TextChunkMessage,
+    PromptSentMessage,
 )
 from claudechic.sessions import (
     find_session_by_prefix,
@@ -536,13 +539,20 @@ class ChatApp(App):
             next_mode = modes[next_idx]
 
         # Schedule the async call to update all agents
+        agent_mgr = self.agent_mgr
+
         async def set_mode():
-            await self.agent_mgr.set_global_permission_mode(next_mode)
+            await agent_mgr.set_global_permission_mode(next_mode)
 
         self.run_worker(set_mode(), exclusive=False)
 
         # Show notification with friendly names
-        display = {"default": "Default", "acceptEdits": "Auto-edit", "plan": "Plan", "bypassPermissions": "Bypass"}
+        display = {
+            "default": "Default",
+            "acceptEdits": "Auto-edit",
+            "plan": "Plan",
+            "bypassPermissions": "Bypass",
+        }
         self.notify(f"Mode: {display[next_mode]}")
 
     def _update_footer_permission_mode(self, mode: str | None = None) -> None:
@@ -643,8 +653,9 @@ class ChatApp(App):
 
         # Use global permission mode from AgentManager (runtime source of truth)
         # CLI flag --yolo sets global_permission_mode at init, no special handling needed here
-        permission_mode = (
-            self.agent_mgr.global_permission_mode if self.agent_mgr else "default"
+        permission_mode: PermissionMode = cast(
+            PermissionMode,
+            self.agent_mgr.global_permission_mode if self.agent_mgr else "default",
         )
         return ClaudeAgentOptions(
             permission_mode=permission_mode,
@@ -1105,6 +1116,27 @@ class ChatApp(App):
         except Exception:
             pass  # OK to fail during shutdown
 
+    def on_text_chunk_message(self, event: TextChunkMessage) -> None:
+        """Handle text chunk via Textual message queue — ensures UI mutation is safe."""
+        chat_view = self._get_chat_view(event.agent_id)
+        if chat_view:
+            chat_view.append_text(
+                event.text, event.new_message, event.parent_tool_use_id
+            )
+
+    def on_prompt_sent_message(self, event: PromptSentMessage) -> None:
+        """Handle prompt sent via Textual message queue — display user message in chat."""
+        chat_view = self._get_chat_view(event.agent_id)
+        if not chat_view:
+            return
+
+        # Skip UI for /clear command (it just forwards to SDK)
+        if event.prompt.strip() == "/clear":
+            return
+
+        chat_view.append_user_message(event.prompt, event.images)
+        chat_view.start_response()
+
     @profile
     def on_tool_use_message(self, event: ToolUseMessage) -> None:
         agent = self._get_agent(event.agent_id)
@@ -1409,8 +1441,24 @@ class ChatApp(App):
             self.post_message(ResponseComplete(None))
             return
         try:
+            # Close stale subagents from the previous session before restoring
+            if self.agent_mgr:
+                main_id = self.agent_mgr.active_id
+                stale_ids = [
+                    aid
+                    for aid in list(self.agent_mgr.agents)
+                    if aid != main_id
+                ]
+                for aid in stale_ids:
+                    await self.agent_mgr.close(aid, soft=False)
+                self.agent_mgr.closed_agents.clear()
+
             await self._reconnect_agent(agent, session_id)
             agent.session_id = session_id
+
+            # Restore subagents from topology (mirrors _connect_initial_client)
+            await self._restore_subagents(session_id)
+
             self.post_message(ResponseComplete(None))
             self.refresh_context()
             # Check for plan file
@@ -1593,7 +1641,9 @@ class ChatApp(App):
         if nudge_count >= self.REPLY_NUDGE_MAX:
             log.info(
                 "Agent '%s' hit max nudge count (%d) for '%s', giving up",
-                agent.name, self.REPLY_NUDGE_MAX, caller,
+                agent.name,
+                self.REPLY_NUDGE_MAX,
+                caller,
             )
             agent._pending_reply_to = None
             agent._reply_nudge_count = 0
@@ -1613,7 +1663,11 @@ class ChatApp(App):
                 return
             # Check caller still exists — no point nudging to reply to a dead agent
             if not self.agent_mgr.find_by_name(caller):
-                log.info("Caller '%s' no longer exists, clearing reply obligation on '%s'", caller, a.name)
+                log.info(
+                    "Caller '%s' no longer exists, clearing reply obligation on '%s'",
+                    caller,
+                    a.name,
+                )
                 a._pending_reply_to = None
                 a._reply_nudge_count = 0
                 return
@@ -1624,7 +1678,13 @@ class ChatApp(App):
                 f"message has been sent to '{caller}'. Remember that an answer is "
                 f"required. Use tell_agent to reply to '{caller}'."
             )
-            log.info("Nudging agent '%s' to reply to '%s' (%d/%d)", a.name, caller, a._reply_nudge_count, self.REPLY_NUDGE_MAX)
+            log.info(
+                "Nudging agent '%s' to reply to '%s' (%d/%d)",
+                a.name,
+                caller,
+                a._reply_nudge_count,
+                self.REPLY_NUDGE_MAX,
+            )
             create_safe_task(a.send(nudge), name=f"nudge-reply-{a.name}")
 
         self.set_timer(self.REPLY_NUDGE_DELAY, _fire_nudge)
@@ -2133,9 +2193,7 @@ class ChatApp(App):
         """Handle model label press - open model selector."""
         self._handle_model_prompt()
 
-    def on_diagnostics_label_requested(
-        self, event: DiagnosticsLabel.Requested
-    ) -> None:  # noqa: ARG002
+    def on_diagnostics_label_requested(self, event: DiagnosticsLabel.Requested) -> None:  # noqa: ARG002
         """Handle diagnostics label press - open diagnostics modal."""
         from claudechic.widgets.modals.diagnostics import DiagnosticsModal
 
@@ -2267,7 +2325,9 @@ class ChatApp(App):
             session_id = agent.session_id
             await agent.disconnect()
             options = self._make_options(
-                cwd=agent.cwd, agent_name=agent.name, model=model,
+                cwd=agent.cwd,
+                agent_name=agent.name,
+                model=model,
                 resume=session_id,
             )
             await agent.connect(options, resume=session_id)
@@ -2708,7 +2768,8 @@ class ChatApp(App):
                 if a._pending_reply_to == closed_name:
                     log.info(
                         "Clearing reply obligation on '%s' — caller '%s' was closed",
-                        a.name, closed_name,
+                        a.name,
+                        closed_name,
                     )
                     a._pending_reply_to = None
                     a._reply_nudge_count = 0
@@ -2876,13 +2937,18 @@ class ChatApp(App):
     def on_text_chunk(
         self, agent: Agent, text: str, new_message: bool, parent_tool_use_id: str | None
     ) -> None:
-        """Handle text chunk from agent - update UI directly (bypasses message queue)."""
+        """Handle text chunk from agent - post Textual Message for UI."""
         sampler = get_sampler()
         if sampler:
             sampler.async_metrics.text_chunks += 1
-        chat_view = self._chat_views.get(agent.id)
-        if chat_view:
-            chat_view.append_text(text, new_message, parent_tool_use_id)
+        self.post_message(
+            TextChunkMessage(
+                text=text,
+                new_message=new_message,
+                parent_tool_use_id=parent_tool_use_id,
+                agent_id=agent.id,
+            )
+        )
 
     def on_tool_use(self, agent: Agent, tool: ToolUse) -> None:
         """Handle tool use from agent - post Textual Message for UI."""
@@ -2952,17 +3018,10 @@ class ChatApp(App):
     def on_prompt_sent(
         self, agent: Agent, prompt: str, images: list[ImageAttachment]
     ) -> None:
-        """Handle prompt sent to agent - display user message in chat view."""
-        chat_view = self._chat_views.get(agent.id)
-        if not chat_view:
-            return
-
-        # Skip UI for /clear command (it just forwards to SDK)
-        if prompt.strip() == "/clear":
-            return
-
-        chat_view.append_user_message(prompt, images)
-        chat_view.start_response()
+        """Handle prompt sent to agent - post Textual Message for UI."""
+        self.post_message(
+            PromptSentMessage(prompt=prompt, images=images, agent_id=agent.id)
+        )
 
     async def _handle_agent_permission_ui(
         self, agent: Agent, request: PermissionRequest

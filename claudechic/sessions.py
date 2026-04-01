@@ -70,7 +70,13 @@ def get_project_sessions_dir(cwd: Path | None = None) -> Path | None:
     cwd = (cwd or Path.cwd()).absolute()
     # Replace path separators with dashes (handles both / and \ on Windows)
     # Also remove Windows drive colon (C:\foo -> C-foo)
-    project_key = str(cwd).replace(os.sep, "-").replace(":", "").replace("_", "-").replace(".", "-")
+    project_key = (
+        str(cwd)
+        .replace(os.sep, "-")
+        .replace(":", "")
+        .replace("_", "-")
+        .replace(".", "-")
+    )
     sessions_dir = Path.home() / ".claude/projects" / project_key
     return sessions_dir if sessions_dir.exists() else None
 
@@ -465,7 +471,11 @@ def _get_project_sessions_dir_for_write(cwd: Path | None = None) -> Path:
     """
     cwd = (cwd or Path.cwd()).absolute()
     project_key = (
-        str(cwd).replace(os.sep, "-").replace(":", "").replace("_", "-").replace(".", "-")
+        str(cwd)
+        .replace(os.sep, "-")
+        .replace(":", "")
+        .replace("_", "-")
+        .replace(".", "-")
     )
     sessions_dir = Path.home() / ".claude/projects" / project_key
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -482,10 +492,9 @@ def save_topology(session_id: str, data: dict, cwd: Path | None = None) -> None:
     sessions_dir = _get_project_sessions_dir_for_write(cwd)
     target = sessions_dir / f"{session_id}.topology.json"
 
+    tmp_path: str | None = None
     try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(sessions_dir), suffix=".topology.tmp"
-        )
+        fd, tmp_path = tempfile.mkstemp(dir=str(sessions_dir), suffix=".topology.tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp_path, str(target))
@@ -493,10 +502,11 @@ def save_topology(session_id: str, data: dict, cwd: Path | None = None) -> None:
     except (IOError, OSError) as exc:
         log.warning("Failed to save topology: %s", exc)
         # Clean up temp file on error
-        try:
-            os.unlink(tmp_path)
-        except (NameError, OSError):
-            pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def load_topology(session_id: str, cwd: Path | None = None) -> dict | None:

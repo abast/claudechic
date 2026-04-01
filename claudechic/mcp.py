@@ -103,7 +103,9 @@ def _clear_pending_reply_if_matched(
     if sender and sender._pending_reply_to == recipient_name:
         sender._pending_reply_to = None
         sender._reply_nudge_count = 0
-        log.debug("Agent '%s' fulfilled reply obligation to '%s'", sender_name, recipient_name)
+        log.debug(
+            "Agent '%s' fulfilled reply obligation to '%s'", sender_name, recipient_name
+        )
 
 
 def _send_prompt_fire_and_forget(
@@ -195,7 +197,9 @@ def _make_spawn_agent(caller_name: str | None = None):
         try:
             # Create agent via AgentManager (handles SDK connection)
             # Hardcode opus for subagents spawned via MCP
-            agent = await _app.agent_mgr.create(name=name, cwd=path, switch_to=False, model="opus")
+            agent = await _app.agent_mgr.create(
+                name=name, cwd=path, switch_to=False, model="opus"
+            )
         except Exception as e:
             return _error_response(f"Error creating agent: {e}")
 
