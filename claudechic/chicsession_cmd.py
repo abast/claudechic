@@ -73,6 +73,17 @@ def _show_usage(app: ChatApp) -> None:
         chat_view.scroll_if_tailing()
 
 
+def _update_sidebar_label(app: ChatApp, name: str | None) -> None:
+    """Update the ChicsessionLabel in the sidebar."""
+    from claudechic.widgets.layout.sidebar import ChicsessionLabel
+
+    try:
+        label = app.query_one("#chicsession-label", ChicsessionLabel)
+        label.name_text = name or ""
+    except Exception:
+        pass  # Widget not mounted yet
+
+
 def _get_root() -> Path:
     """Return git root if in a repo, else PWD."""
     try:
@@ -127,6 +138,7 @@ def _handle_save(app: ChatApp, name: str) -> None:
 
     # Activate auto-save: future agent create/close will update this file
     app._chicsession_name = name
+    _update_sidebar_label(app, name)
 
     app.notify(f"Chicsession '{name}' saved — {len(entries)} agent(s)")
     log.info("Saved chicsession '%s' with %d agents", name, len(entries))
@@ -217,6 +229,7 @@ async def _handle_restore(app: ChatApp, name: str) -> None:
 
     # Activate auto-save: future agent create/close will update this file
     app._chicsession_name = name
+    _update_sidebar_label(app, name)
 
     msg = f"Chicsession '{name}' restored — {restored} agent(s)"
     if failed:
