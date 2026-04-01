@@ -1461,9 +1461,7 @@ class ChatApp(App):
             if self.agent_mgr:
                 main_id = self.agent_mgr.active_id
                 stale_ids = [
-                    aid
-                    for aid in list(self.agent_mgr.agents)
-                    if aid != main_id
+                    aid for aid in list(self.agent_mgr.agents) if aid != main_id
                 ]
                 for aid in stale_ids:
                     await self.agent_mgr.close(aid, soft=False)
@@ -2119,7 +2117,6 @@ class ChatApp(App):
         if self._agent and self._agent.id == agent.id:
             self.plan_section.set_plan(plan_path)
 
-
     def action_escape(self) -> None:
         """Handle Escape: cancel picker, dismiss prompts, close overlay, or interrupt agent."""
         # Sidebar overlay takes priority (most likely what user wants to dismiss)
@@ -2568,7 +2565,7 @@ class ChatApp(App):
 
         self.notify(f"Agent '{agent_name}' closed")
 
-    @work(group="close_agent", exclusive=True, exit_on_error=False)
+    @work(group="close_agent", exclusive=False, exit_on_error=False)
     async def _do_close_agent(self, agent_id: str) -> None:
         """Close an agent via Textual worker (fire-and-forget for UI callers)."""
         await self._close_agent_core(agent_id)
