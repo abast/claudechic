@@ -193,18 +193,31 @@ async def _handle_restore(app: ChatApp, name: str) -> None:
     restored = 0
     failed = 0
     for entry in cs.agents:
-        # Skip if an agent with this name already exists
-        existing = agent_mgr.find_by_name(entry.name)
-        if existing:
-            log.info("Agent '%s' already running, skipping restore", entry.name)
-            restored += 1
-            continue
-
         if not entry.session_id:
             log.warning("Skipping agent '%s': no session_id", entry.name)
             continue
 
         cwd = Path(entry.cwd) if entry.cwd else Path.cwd()
+
+        # If an agent with this name already exists, reconnect it to the saved session
+        existing = agent_mgr.find_by_name(entry.name)
+        if existing:
+            try:
+                await app._reconnect_agent(existing, entry.session_id)
+                existing.session_id = entry.session_id
+                # Clear and reload history in the chat view
+                chat_view = app._chat_views.get(existing.id)
+                if chat_view:
+                    chat_view.clear()
+                await app._load_and_display_history(
+                    entry.session_id, cwd=cwd, agent=existing
+                )
+                restored += 1
+                log.info("Reconnected existing agent '%s' to saved session", entry.name)
+            except Exception as exc:
+                log.warning("Failed to reconnect agent '%s': %s", entry.name, exc)
+                failed += 1
+            continue
 
         try:
             agent = await agent_mgr.create(
