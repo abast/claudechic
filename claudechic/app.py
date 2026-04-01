@@ -696,6 +696,9 @@ class ChatApp(App):
         # Start background process polling
         self.set_interval(2.0, self._poll_background_processes)
 
+        # Periodic hints re-evaluation (every 2 hours)
+        self.set_interval(7200, self._periodic_hints)
+
         # Register app for MCP tools
         set_app(self)
 
@@ -767,6 +770,10 @@ class ChatApp(App):
 
         # Connect SDK in background - UI renders while this happens
         self._connect_initial_client()
+
+        # Hints system startup — fire-and-forget background task
+        from claudechic.tasks import create_safe_task
+        create_safe_task(self._run_hints(is_startup=True, budget=2), name="hints-startup")
 
     def watch_theme(self, theme: str) -> None:
         """Save theme preference when changed (skip if overridden by CLI flag)."""
@@ -919,6 +926,47 @@ class ChatApp(App):
         self.process_panel.update_processes(processes)
         self.status_footer.update_processes(processes)
         self._position_right_sidebar()
+
+    async def _run_hints(self, *, is_startup: bool = True, budget: int = 2) -> None:
+        """Discover and evaluate project hints (fire-and-forget)."""
+        hints_dir = self._cwd / "hints"
+        if not hints_dir.is_dir() or not (hints_dir / "__init__.py").is_file():
+            return
+
+        try:
+            import importlib.util
+
+            # Load hints package directly from path — no sys.path mutation.
+            # Uses submodule_search_locations so relative imports work.
+            spec = importlib.util.spec_from_file_location(
+                "hints",
+                hints_dir / "__init__.py",
+                submodule_search_locations=[str(hints_dir)],
+            )
+            if spec is None or spec.loader is None:
+                return
+
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["hints"] = mod
+            spec.loader.exec_module(mod)
+
+            from claudechic.sessions import count_sessions
+
+            await mod.evaluate(
+                send_notification=self.notify,
+                project_root=self._cwd,
+                session_count=count_sessions(self._cwd),
+                is_startup=is_startup,
+                budget=budget,
+            )
+        except Exception:
+            # IRON RULE: hints must never crash ClaudeChic
+            log.debug("Hints evaluation failed", exc_info=True)
+
+    def _periodic_hints(self) -> None:
+        """Trigger periodic hints evaluation (1 toast max, non-startup delays)."""
+        from claudechic.tasks import create_safe_task
+        create_safe_task(self._run_hints(is_startup=False, budget=1), name="hints-periodic")
 
     _review_poll_timer: Timer | None = None
     _review_poll_agent_id: str | None = None  # agent that owns the poll timer
