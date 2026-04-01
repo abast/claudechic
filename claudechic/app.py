@@ -1170,7 +1170,7 @@ class ChatApp(App):
         )
         # Don't show thinking indicator if agent was interrupted — the
         # ToolResultMessage may arrive (from the message queue) after
-        # _interrupt_and_cleanup has already cleared the response state.
+        # interrupt() has already cleared the response state.
         agent = self._get_agent(event.agent_id)
         if agent and agent._response_state == ResponseState.INTERRUPTED:
             return
@@ -2119,23 +2119,6 @@ class ChatApp(App):
         if self._agent and self._agent.id == agent.id:
             self.plan_section.set_plan(plan_path)
 
-    async def _interrupt_and_cleanup(self, agent: "Agent") -> None:
-        """Interrupt agent and clean up response state after cancellation completes.
-
-        Cleanup must happen AFTER interrupt() returns, not before — otherwise
-        late text chunks (still arriving before the response task is cancelled)
-        can recreate _current_response, leaving stale state that blocks the
-        next response from rendering.
-
-        Note: agent.interrupt() already calls on_complete() which triggers
-        ResponseComplete → end_response, so we only flush + hide thinking here.
-        """
-        await agent.interrupt()
-        # Now the response task is fully cancelled — no more text chunks
-        self._hide_thinking()
-        chat_view = self._chat_views.get(agent.id)
-        if chat_view and chat_view._current_response:
-            chat_view._current_response.flush()
 
     def action_escape(self) -> None:
         """Handle Escape: cancel picker, dismiss prompts, close overlay, or interrupt agent."""
@@ -2153,11 +2136,11 @@ class ChatApp(App):
             active_prompt.cancel()
             return
 
-        # Interrupt running agent - route through _interrupt_and_cleanup which
-        # calls agent.interrupt() (SDK-first + SIGINT fallback) then cleans up UI.
+        # Interrupt running agent via Agent.interrupt() (handles SDK interrupt,
+        # SIGINT fallback, on_complete, and state cleanup).
         if self._agent and self._agent.status == "busy":
             self.run_worker(
-                self._interrupt_and_cleanup(self._agent),
+                self._agent.interrupt(),
                 exclusive=False,
                 exit_on_error=False,
             )

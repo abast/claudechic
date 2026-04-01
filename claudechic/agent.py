@@ -201,7 +201,7 @@ class Agent:
         # Response state machine (see ResponseState enum for valid transitions)
         self._response_state: ResponseState = ResponseState.IDLE
         self._response: ResponseContext = ResponseContext()
-        self._previous_was_interrupted: bool = False  # Previous response was interrupted (drain leftovers)
+        self._drain_stale_on_next_response: bool = False  # Drain leftover SDK messages after interrupt
 
         # Chat history
         self.messages: list[ChatItem] = []
@@ -520,8 +520,7 @@ class Agent:
 
         self._set_status(AgentStatus.BUSY)
 
-        # Reset per-response state — remember if prev response was interrupted (for drain)
-        self._previous_was_interrupted = self._response_state == ResponseState.INTERRUPTED
+        # Reset per-response state
         self._response = ResponseContext()
         self._set_response_state(ResponseState.STREAMING)
 
@@ -556,7 +555,7 @@ class Agent:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 # Task didn't finish in time — SIGINT the CLI subprocess
                 log.warning("Agent '%s': task didn't finish after cancel, sending SIGINT", self.name)
-                self._sigint_cli_process()
+                self._sigint_fallback()
 
         self._set_response_state(ResponseState.IDLE)
         self._set_status(AgentStatus.IDLE)
@@ -568,9 +567,10 @@ class Agent:
         if self.observer:
             self.observer.on_complete(self, None)
 
+        self._drain_stale_on_next_response = True
         log.info("Agent '%s': interrupt() completed", self.name)
 
-    def _sigint_cli_process(self) -> None:
+    def _sigint_fallback(self) -> None:
         """Send SIGINT directly to the CLI subprocess as a last-resort interrupt.
 
         This bypasses the SDK control protocol entirely and sends an OS-level
@@ -675,12 +675,13 @@ Key Rules:
 
             had_tool_use: dict[str | None, bool] = {}
 
-            # After an interrupt, the SDK stream may contain leftover messages
-            # (ToolResult, ResultMessage) from the cancelled response.  The
-            # ResultMessage terminates the receive_response() iterator, so we
-            # must drain them in a separate loop, then call receive_response()
-            # again for the real response.
-            if self._previous_was_interrupted:
+            # Drain stale messages from previous interrupted response.
+            # The SDK stream may contain leftover messages (ToolResult,
+            # ResultMessage) from the cancelled response.  The ResultMessage
+            # terminates the receive_response() iterator, so we drain them
+            # first, then call receive_response() again for the real response.
+            if self._drain_stale_on_next_response:
+                self._drain_stale_on_next_response = False
                 async for message in self.client.receive_response():  # type: ignore[union-attr]
                     if isinstance(message, (AssistantMessage, StreamEvent)):
                         # Real response started in same stream — process it
