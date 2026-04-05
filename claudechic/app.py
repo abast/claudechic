@@ -630,6 +630,127 @@ class ChatApp(App):
             "PreToolUse": [HookMatcher(matcher=None, hooks=[block_mutating_tools])],  # type: ignore[arg-type]
         }
 
+    def _guardrail_hooks(self, agent_role: str | None = None) -> "dict[HookEvent, list[HookMatcher]]":
+        """Create PreToolUse hooks that evaluate guardrail rules from rules.yaml.
+
+        PoC: proves SDK hooks can replace file-based guardrail hooks.
+        """
+        from claudechic.guardrails.rules import (
+            load_rules,
+            match_rule,
+            matches_trigger,
+            read_phase_state,
+            should_skip_for_phase,
+            should_skip_for_role,
+        )
+
+        rules_path = Path(self._cwd if hasattr(self, "_cwd") else Path.cwd()) / ".claude/guardrails/rules.yaml"
+        phase_state_path = rules_path.parent / "phase_state.json"
+        app = self
+
+        async def evaluate(
+            hook_input: dict,
+            match: str | None,  # noqa: ARG001
+            ctx: object,  # noqa: ARG001
+        ) -> dict:
+            """PreToolUse hook: evaluate all guardrail rules from rules.yaml."""
+            import sys
+            import time
+
+            try:
+                t0 = time.monotonic()
+
+                rules = load_rules(rules_path)  # Always fresh — supports live edits
+                t_yaml = time.monotonic() - t0
+
+                phase_state = read_phase_state(phase_state_path)
+                tool_name = hook_input.get("tool_name", "")
+                tool_input = hook_input.get("tool_input", {})
+
+                for rule in rules:
+                    if not matches_trigger(rule, tool_name):
+                        continue
+                    if should_skip_for_role(rule, agent_role):
+                        continue
+                    if should_skip_for_phase(rule, phase_state):
+                        continue
+                    if not match_rule(rule, tool_name, tool_input):
+                        continue
+
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    print(
+                        f"[guardrail-hook] MATCHED {rule.id} enf={rule.enforcement} | yaml={t_yaml*1000:.1f}ms eval={elapsed_ms:.1f}ms",
+                        file=sys.stderr,
+                    )
+
+                    if rule.enforcement == "deny":
+                        return {"decision": "block", "reason": rule.message}
+
+                    if rule.enforcement == "user_confirm":
+                        print(f"[guardrail-hook] showing user_confirm prompt for {rule.id}", file=sys.stderr)
+                        approved = await app._show_guardrail_confirm(rule)
+                        print(f"[guardrail-hook] user_confirm result: approved={approved}", file=sys.stderr)
+                        if not approved:
+                            return {"decision": "block", "reason": f"User denied: {rule.message}"}
+                        return {}
+
+                    if rule.enforcement == "warn":
+                        return {"decision": "block", "reason": rule.message}
+
+                    # "log" enforcement: fall through (allow, but we logged above)
+
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                if elapsed_ms > 5:  # Only log if above 5ms threshold
+                    print(
+                        f"[guardrail-hook] no-match | yaml={t_yaml*1000:.1f}ms total={elapsed_ms:.1f}ms",
+                        file=sys.stderr,
+                    )
+
+                return {}
+            except Exception as e:
+                import traceback
+                print(f"[guardrail-hook] ERROR: {e}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+                return {}  # Fail-open for PoC debugging
+
+        return {
+            "PreToolUse": [HookMatcher(matcher=None, hooks=[evaluate])],  # type: ignore[arg-type]
+        }
+
+    async def _show_guardrail_confirm(self, rule: "Any") -> bool:
+        """Show a guardrail confirmation prompt to the user.
+
+        Uses the same _show_prompt + SelectionPrompt pattern as the
+        existing permission flow. Returns True if user allows.
+        """
+        from claudechic.widgets.prompts import SelectionPrompt
+
+        try:
+            options = [
+                ("allow", f"Allow — proceed with this action"),
+                ("deny", f"Deny — block this action"),
+            ]
+            title = f"\U0001f6e1\ufe0f Guardrail {rule.id}: {rule.message}"
+            prompt = SelectionPrompt(title, options)
+
+            async with self._show_prompt(prompt):
+                result = await prompt.wait()
+
+            return result == "allow"
+        except Exception as e:
+            import sys
+
+            print(f"[guardrail-hook] confirm prompt error: {e}", file=sys.stderr)
+            return False  # Deny on error
+
+    def _merged_hooks(self, agent_type: str | None = None) -> "dict[HookEvent, list[HookMatcher]]":
+        """Merge plan-mode hooks with guardrail hooks."""
+        hooks = self._plan_mode_hooks()
+        guardrail_hooks = self._guardrail_hooks(agent_role=agent_type)
+        for event, matchers in guardrail_hooks.items():
+            hooks.setdefault(event, []).extend(matchers)
+        return hooks
+
     def _make_options(
         self,
         cwd: Path | None = None,
@@ -676,7 +797,7 @@ class ChatApp(App):
             mcp_servers={"chic": create_chic_server(caller_name=agent_name)},
             include_partial_messages=True,
             stderr=self._handle_sdk_stderr,
-            hooks=self._plan_mode_hooks(),
+            hooks=self._merged_hooks(agent_type=agent_type),
             enable_file_checkpointing=True,
             extra_args={"replay-user-messages": None},
         )
