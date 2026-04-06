@@ -4,6 +4,7 @@ Public API exports for use by other claudechic packages.
 """
 
 from claudechic.hints.engine import run_pipeline
+from claudechic.hints.parsers import HintsParser
 from claudechic.hints.types import (
     AlwaysTrue,
     CooldownPeriod,
@@ -24,6 +25,7 @@ __all__ = [
     "HintLifecycle",
     "HintRecord",
     "HintSpec",
+    "HintsParser",
     "ShowEverySession",
     "ShowOnce",
     "ShowUntilResolved",

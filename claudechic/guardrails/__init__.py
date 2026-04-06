@@ -17,6 +17,7 @@ from claudechic.guardrails.rules import (
     should_skip_for_phase,
     should_skip_for_role,
 )
+from claudechic.guardrails.parsers import InjectionsParser, RulesParser
 from claudechic.guardrails.tokens import OverrideToken, OverrideTokenStore
 
 __all__ = [
@@ -37,6 +38,9 @@ __all__ = [
     # hits.py
     "HitRecord",
     "HitLogger",
+    # parsers.py
+    "RulesParser",
+    "InjectionsParser",
     # tokens.py
     "OverrideToken",
     "OverrideTokenStore",

@@ -1139,9 +1139,10 @@ class ChatApp(App):
                 global_dir=self._cwd / "global",
                 workflows_dir=self._cwd / "workflows",
             )
-            # Parsers are registered by the loader at load() time via
-            # built-in defaults. External parsers can also be registered
-            # before the first load() call.
+            # Register all built-in section parsers before first load()
+            from claudechic.workflows import register_default_parsers
+
+            register_default_parsers(self._manifest_loader)
         except Exception:
             log.debug("Workflow infrastructure init failed", exc_info=True)
 
