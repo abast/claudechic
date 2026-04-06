@@ -1,7 +1,6 @@
-"""Minimal rule loader for SDK guardrail hooks.
+"""Rule and Injection dataclasses, matching functions, and YAML loader.
 
-Parses .claude/guardrails/rules.yaml into Rule objects and provides
-matching functions for PreToolUse hook evaluation.
+Leaf module within guardrails/ — no imports from workflows/, checks/, or hints/.
 """
 
 from __future__ import annotations
@@ -17,24 +16,47 @@ import yaml
 
 @dataclass(frozen=True)
 class Rule:
-    """A single guardrail rule parsed from rules.yaml."""
+    """A single guardrail rule parsed from a manifest."""
 
-    id: str
-    name: str
-    trigger: list[str]  # e.g. ["PreToolUse/Bash"] or ["PreToolUse/Write", "PreToolUse/Edit"]
-    enforcement: str  # "deny" | "warn" | "log" | "user_confirm"
+    id: str  # Qualified: "project-team:pip_block"
+    namespace: str  # Required, no default: "global" or workflow_id
+    trigger: list[str]  # e.g. ["PreToolUse/Bash"]
+    enforcement: str  # "deny" | "warn" | "log"
     detect_pattern: re.Pattern[str] | None = None
     detect_field: str = "command"  # which tool_input field to match against
     exclude_pattern: re.Pattern[str] | None = None
     message: str = ""
-    block_roles: list[str] = field(default_factory=list)
-    allow_roles: list[str] = field(default_factory=list)
-    phase_block: list[str] = field(default_factory=list)
-    phase_allow: list[str] = field(default_factory=list)
+    roles: list[str] = field(default_factory=list)
+    exclude_roles: list[str] = field(default_factory=list)
+    phases: list[str] = field(default_factory=list)
+    exclude_phases: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Injection:
+    """A tool-input modification declared in the injections: manifest section.
+
+    Separate from Rule — not an enforcement level. Processed BEFORE
+    enforcement rules in the hook pipeline.
+    """
+
+    id: str  # Qualified: "project-team:force_tee"
+    namespace: str
+    trigger: list[str]  # Same trigger format as rules
+    detect_pattern: re.Pattern[str] | None = None
+    detect_field: str = "command"
+    inject_value: str = ""  # What to inject
+    roles: list[str] = field(default_factory=list)
+    exclude_roles: list[str] = field(default_factory=list)
+    phases: list[str] = field(default_factory=list)
+    exclude_phases: list[str] = field(default_factory=list)
 
 
 def load_rules(rules_path: Path) -> list[Rule]:
-    """Parse rules.yaml into Rule objects. Returns empty list if file missing."""
+    """Parse rules.yaml into Rule objects. Returns empty list if file missing.
+
+    Legacy loader — will be replaced by ManifestLoader in workflows/loader.py.
+    """
     if not rules_path.is_file():
         return []
 
@@ -69,43 +91,44 @@ def load_rules(rules_path: Path) -> list[Rule]:
         if exclude_str:
             exclude_pattern = re.compile(exclude_str)
 
-        # Parse role restrictions
-        block_roles = entry.get("block", [])
-        if isinstance(block_roles, str):
-            block_roles = [block_roles]
-        allow_roles = entry.get("allow", [])
-        if isinstance(allow_roles, str):
-            allow_roles = [allow_roles]
+        # Parse role restrictions (new field names)
+        roles = _as_list(entry.get("roles", []))
+        exclude_roles = _as_list(entry.get("exclude_roles", []))
 
-        # Parse phase restrictions
-        phase_block = entry.get("phase_block", [])
-        if isinstance(phase_block, str):
-            phase_block = [phase_block]
-        phase_allow = entry.get("phase_allow", [])
-        if isinstance(phase_allow, str):
-            phase_allow = [phase_allow]
+        # Parse phase restrictions (new field names)
+        phases = _as_list(entry.get("phases", []))
+        exclude_phases = _as_list(entry.get("exclude_phases", []))
 
         rules.append(
             Rule(
                 id=entry.get("id", ""),
-                name=entry.get("name", ""),
+                namespace=entry.get("namespace", "global"),
                 trigger=triggers,
                 enforcement=entry.get("enforcement", "deny"),
                 detect_pattern=detect_pattern,
                 detect_field=detect_field,
                 exclude_pattern=exclude_pattern,
                 message=entry.get("message", ""),
-                block_roles=block_roles,
-                allow_roles=allow_roles,
-                phase_block=phase_block,
-                phase_allow=phase_allow,
+                roles=roles,
+                exclude_roles=exclude_roles,
+                phases=phases,
+                exclude_phases=exclude_phases,
             )
         )
 
     return rules
 
 
-def matches_trigger(rule: Rule, tool_name: str) -> bool:
+def _as_list(value: Any) -> list[str]:
+    """Normalize a value to a list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return list(value)
+    return []
+
+
+def matches_trigger(rule: Rule | Injection, tool_name: str) -> bool:
     """Check if rule's trigger matches the tool event.
 
     Trigger format: "PreToolUse/Bash" — we extract the tool name part after '/'.
@@ -133,9 +156,7 @@ def match_rule(rule: Rule, tool_name: str, tool_input: dict[str, Any]) -> bool:
         return True
 
     # Get the field to match against
-    text = tool_input.get(rule.detect_field, "")
-    if not isinstance(text, str):
-        text = str(text)
+    text = _get_field(tool_input, rule.detect_field)
 
     # Check exclude first — if exclude matches, rule does NOT fire
     if rule.exclude_pattern and rule.exclude_pattern.search(text):
@@ -145,48 +166,87 @@ def match_rule(rule: Rule, tool_name: str, tool_input: dict[str, Any]) -> bool:
     return bool(rule.detect_pattern.search(text))
 
 
-def should_skip_for_role(rule: Rule, agent_role: str | None) -> bool:
+def _get_field(tool_input: dict, field: str) -> str:
+    """Extract a field from tool_input for pattern matching.
+
+    Simple dict lookup, returns empty string for missing keys.
+    """
+    return str(tool_input.get(field, ""))
+
+
+def should_skip_for_role(rule: Rule | Injection, agent_role: str | None) -> bool:
     """Return True if the rule should be skipped for this agent role.
 
-    - block_roles: rule only fires for these roles (skip if role not in list)
-    - allow_roles: rule never fires for these roles (skip if role in list)
+    - roles: rule only fires for these roles (skip if role not in list)
+    - exclude_roles: rule never fires for these roles (skip if role in list)
     """
-    if rule.block_roles:
+    if rule.roles:
         # Rule only applies to specific roles
-        if agent_role is None or agent_role not in rule.block_roles:
+        if agent_role is None or agent_role not in rule.roles:
             return True
-    if rule.allow_roles:
-        # Rule is skipped for allowed roles
-        if agent_role and agent_role in rule.allow_roles:
+    if rule.exclude_roles:
+        # Rule is skipped for excluded roles
+        if agent_role and agent_role in rule.exclude_roles:
             return True
     return False
 
 
-def should_skip_for_phase(rule: Rule, phase_state: dict[str, Any] | None) -> bool:
+def should_skip_for_phase(rule: Rule | Injection, current_phase: str | None) -> bool:
     """Return True if rule should be skipped based on current phase.
 
-    Phase state is read from .claude/guardrails/phase_state.json.
+    Takes the current qualified phase ID string directly (from engine).
     """
-    if not rule.phase_block and not rule.phase_allow:
+    if not rule.phases and not rule.exclude_phases:
         return False  # No phase restrictions
 
-    if phase_state is None:
-        return False  # No phase info = don't skip
+    if current_phase is None:
+        return bool(rule.phases)  # Skip if rule requires specific phases; don't skip if only exclude_phases
 
-    current_phase = phase_state.get("current_phase", "")
-    if not current_phase:
-        return False
-
-    if rule.phase_block and current_phase in rule.phase_block:
-        return True  # Skip: blocked in this phase
-    if rule.phase_allow and current_phase not in rule.phase_allow:
+    if rule.phases and current_phase not in rule.phases:
         return True  # Skip: not in allowed phase
 
+    if rule.exclude_phases and current_phase in rule.exclude_phases:
+        return True  # Skip: excluded in this phase
+
     return False
+
+
+def apply_injection(injection: Injection, tool_input: dict) -> dict:
+    """Apply an injection rule to tool_input, returning a modified copy.
+
+    The injection's detect pattern identifies what to modify, and
+    inject_value specifies what to inject. Exact injection semantics
+    depend on the specific injection's configuration.
+
+    Args:
+        injection: An Injection with detect pattern and inject_value.
+        tool_input: The current tool input dict.
+
+    Returns:
+        A modified copy of tool_input with the injection applied.
+    """
+    field = injection.detect_field
+    current_value = _get_field(tool_input, field)
+    if not current_value:
+        return tool_input
+
+    # Check detect pattern if present
+    if injection.detect_pattern and not injection.detect_pattern.search(current_value):
+        return tool_input
+
+    # Apply injection — modify the target field
+    modified = dict(tool_input)
+    modified[field] = (
+        f"{current_value}\n{injection.inject_value}" if injection.inject_value else current_value
+    )
+    return modified
 
 
 def read_phase_state(phase_state_path: Path) -> dict[str, Any] | None:
-    """Read phase state from JSON file. Returns None if missing."""
+    """Read phase state from JSON file. Returns None if missing.
+
+    Legacy — will be replaced by in-memory engine state via Chicsession.
+    """
     if not phase_state_path.is_file():
         return None
     try:

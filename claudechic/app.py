@@ -221,6 +221,14 @@ class ChatApp(App):
         # Active chicsession name — when set, agent create/close auto-saves
         self._chicsession_name: str | None = None
 
+        # Workflow guidance system — initialized in on_mount()
+        self._manifest_loader: Any = None  # ManifestLoader
+        self._hit_logger: Any = None  # HitLogger
+        self._token_store: Any = None  # OverrideTokenStore
+        self._load_result: Any = None  # LoadResult
+        self._workflow_registry: dict[str, Path] = {}  # workflow_id -> directory
+        self._workflow_engine: Any = None  # WorkflowEngine
+
     def _fatal_error(self) -> None:
         """Override to use plain Python tracebacks instead of rich's fancy ones."""
         import traceback
@@ -631,106 +639,48 @@ class ChatApp(App):
         }
 
     def _guardrail_hooks(self, agent_role: str | None = None) -> "dict[HookEvent, list[HookMatcher]]":
-        """Create PreToolUse hooks that evaluate guardrail rules from rules.yaml.
+        """Create PreToolUse hooks that evaluate rules from manifests.
 
-        PoC: proves SDK hooks can replace file-based guardrail hooks.
+        Delegates to create_guardrail_hooks() in guardrails/hooks.py.
+        Two-step pipeline: injections first, then enforcement (log/warn/deny).
         """
-        from claudechic.guardrails.rules import (
-            load_rules,
-            match_rule,
-            matches_trigger,
-            read_phase_state,
-            should_skip_for_phase,
-            should_skip_for_role,
+        if not self._manifest_loader or not self._hit_logger or not self._token_store:
+            return {}
+
+        from claudechic.guardrails.hooks import create_guardrail_hooks
+
+        return create_guardrail_hooks(
+            loader=self._manifest_loader,
+            hit_logger=self._hit_logger,
+            agent_role=agent_role,
+            get_phase=lambda: (
+                self._workflow_engine.get_current_phase()
+                if self._workflow_engine
+                else None
+            ),
+            get_active_wf=lambda: (
+                self._workflow_engine.workflow_id
+                if self._workflow_engine
+                else None
+            ),
+            consume_override=self._token_store.consume,
         )
 
-        rules_path = Path(self._cwd if hasattr(self, "_cwd") else Path.cwd()) / ".claude/guardrails/rules.yaml"
-        phase_state_path = rules_path.parent / "phase_state.json"
-        app = self
+    async def _show_override_prompt(self, rule_id: str, description: str) -> bool:
+        """Show override approval prompt for deny-level rules.
 
-        async def evaluate(
-            hook_input: dict,
-            match: str | None,  # noqa: ARG001
-            ctx: object,  # noqa: ARG001
-        ) -> dict:
-            """PreToolUse hook: evaluate all guardrail rules from rules.yaml."""
-            import sys
-            import time
-
-            try:
-                t0 = time.monotonic()
-
-                rules = load_rules(rules_path)  # Always fresh — supports live edits
-                t_yaml = time.monotonic() - t0
-
-                phase_state = read_phase_state(phase_state_path)
-                tool_name = hook_input.get("tool_name", "")
-                tool_input = hook_input.get("tool_input", {})
-
-                for rule in rules:
-                    if not matches_trigger(rule, tool_name):
-                        continue
-                    if should_skip_for_role(rule, agent_role):
-                        continue
-                    if should_skip_for_phase(rule, phase_state):
-                        continue
-                    if not match_rule(rule, tool_name, tool_input):
-                        continue
-
-                    elapsed_ms = (time.monotonic() - t0) * 1000
-                    print(
-                        f"[guardrail-hook] MATCHED {rule.id} enf={rule.enforcement} | yaml={t_yaml*1000:.1f}ms eval={elapsed_ms:.1f}ms",
-                        file=sys.stderr,
-                    )
-
-                    if rule.enforcement == "deny":
-                        return {"decision": "block", "reason": rule.message}
-
-                    if rule.enforcement == "user_confirm":
-                        print(f"[guardrail-hook] showing user_confirm prompt for {rule.id}", file=sys.stderr)
-                        approved = await app._show_guardrail_confirm(rule)
-                        print(f"[guardrail-hook] user_confirm result: approved={approved}", file=sys.stderr)
-                        if not approved:
-                            return {"decision": "block", "reason": f"User denied: {rule.message}"}
-                        return {}
-
-                    if rule.enforcement == "warn":
-                        return {"decision": "block", "reason": rule.message}
-
-                    # "log" enforcement: fall through (allow, but we logged above)
-
-                elapsed_ms = (time.monotonic() - t0) * 1000
-                if elapsed_ms > 5:  # Only log if above 5ms threshold
-                    print(
-                        f"[guardrail-hook] no-match | yaml={t_yaml*1000:.1f}ms total={elapsed_ms:.1f}ms",
-                        file=sys.stderr,
-                    )
-
-                return {}
-            except Exception as e:
-                import traceback
-                print(f"[guardrail-hook] ERROR: {e}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-                return {}  # Fail-open for PoC debugging
-
-        return {
-            "PreToolUse": [HookMatcher(matcher=None, hooks=[evaluate])],  # type: ignore[arg-type]
-        }
-
-    async def _show_guardrail_confirm(self, rule: "Any") -> bool:
-        """Show a guardrail confirmation prompt to the user.
-
-        Uses the same _show_prompt + SelectionPrompt pattern as the
-        existing permission flow. Returns True if user allows.
+        Used by the request_override MCP tool. User sees the exact
+        command details and approves/denies the specific action.
+        Returns True if user allows.
         """
         from claudechic.widgets.prompts import SelectionPrompt
 
         try:
             options = [
-                ("allow", f"Allow — proceed with this action"),
-                ("deny", f"Deny — block this action"),
+                ("allow", "Allow — approve this specific action"),
+                ("deny", "Deny — block this action"),
             ]
-            title = f"\U0001f6e1\ufe0f Guardrail {rule.id}: {rule.message}"
+            title = f"\U0001f6e1\ufe0f Override request: {rule_id}"
             prompt = SelectionPrompt(title, options)
 
             async with self._show_prompt(prompt):
@@ -738,17 +688,30 @@ class ChatApp(App):
 
             return result == "allow"
         except Exception as e:
-            import sys
-
-            print(f"[guardrail-hook] confirm prompt error: {e}", file=sys.stderr)
+            log.warning("Override prompt error for %s: %s", rule_id, e)
             return False  # Deny on error
 
     def _merged_hooks(self, agent_type: str | None = None) -> "dict[HookEvent, list[HookMatcher]]":
-        """Merge plan-mode hooks with guardrail hooks."""
+        """Merge plan-mode hooks, guardrail hooks, and PostCompact hook."""
         hooks = self._plan_mode_hooks()
+
+        # Rule-evaluation hooks (extracted to guardrails/hooks.py)
         guardrail_hooks = self._guardrail_hooks(agent_role=agent_type)
         for event, matchers in guardrail_hooks.items():
             hooks.setdefault(event, []).extend(matchers)
+
+        # PostCompact hook — re-injects phase context after /compact
+        if self._workflow_engine:
+            from claudechic.workflows.agent_folders import create_post_compact_hook
+
+            compact_hooks = create_post_compact_hook(
+                engine=self._workflow_engine,
+                agent_role=agent_type or "",
+                workflows_dir=self._cwd / "workflows",
+            )
+            for event, matchers in compact_hooks.items():
+                hooks.setdefault(event, []).extend(matchers)
+
         return hooks
 
     def _make_options(
@@ -834,6 +797,9 @@ class ChatApp(App):
         # Register app for MCP tools
         set_app(self)
 
+        # Initialize workflow guidance infrastructure
+        self._init_workflow_infrastructure()
+
         # Start remote control server if requested
         if self._remote_port:
             from claudechic.remote import start_server
@@ -900,6 +866,9 @@ class ChatApp(App):
         if agent:
             self._refresh_reviews(agent)
 
+        # Discover workflow manifests and register slash commands
+        self._discover_workflows()
+
         # Connect SDK in background - UI renders while this happens
         self._connect_initial_client()
 
@@ -961,6 +930,9 @@ class ChatApp(App):
         if resume:
             await self._load_and_display_history(resume)
             self.notify(f"Resuming {resume[:8]}...")
+
+            # Restore workflow state from chicsession if present
+            self._restore_workflow_from_session()
 
         # Fetch SDK commands and update autocomplete
         await self._update_slash_commands()
@@ -1057,37 +1029,87 @@ class ChatApp(App):
         self._position_right_sidebar()
 
     async def _run_hints(self, *, is_startup: bool = True, budget: int = 2) -> None:
-        """Discover and evaluate project hints (fire-and-forget)."""
-        hints_dir = self._cwd / "hints"
-        if not hints_dir.is_dir() or not (hints_dir / "__init__.py").is_file():
-            return
-
+        """Evaluate project hints via claudechic.hints pipeline."""
         try:
-            import importlib.util
-
-            # Load hints package directly from path — no sys.path mutation.
-            # Uses submodule_search_locations so relative imports work.
-            spec = importlib.util.spec_from_file_location(
-                "hints",
-                hints_dir / "__init__.py",
-                submodule_search_locations=[str(hints_dir)],
+            from claudechic.hints import run_pipeline
+            from claudechic.hints.state import (
+                ActivationConfig,
+                HintStateStore,
+                ProjectState,
             )
-            if spec is None or spec.loader is None:
-                return
 
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["hints"] = mod
-            spec.loader.exec_module(mod)
-
-            from claudechic.sessions import count_sessions
-
-            await mod.evaluate(
-                send_notification=self.notify,
-                project_root=self._cwd,
-                session_count=count_sessions(self._cwd),
-                is_startup=is_startup,
-                budget=budget,
+            state_store = HintStateStore(self._cwd)
+            activation = ActivationConfig(state_store)
+            current_phase = (
+                self._workflow_engine.get_current_phase()
+                if self._workflow_engine
+                else None
             )
+            project_state = ProjectState.build(
+                self._cwd, current_phase=current_phase
+            )
+
+            # Collect hints from load result (manifest-declared hints)
+            hint_specs = []
+            if self._load_result:
+                from claudechic.hints.types import (
+                    AlwaysTrue,
+                    HintSpec,
+                    ShowOnce,
+                    ShowUntilResolved,
+                )
+
+                for decl in self._load_result.hints:
+                    lifecycle = ShowOnce()
+                    if decl.lifecycle == "show-until-resolved":
+                        lifecycle = ShowUntilResolved()
+                    hint_specs.append(
+                        HintSpec(
+                            id=decl.id,
+                            trigger=AlwaysTrue(),
+                            message=decl.message,
+                            lifecycle=lifecycle,
+                        )
+                    )
+
+            # Also load template-side hints if they exist (backward compat)
+            hints_dir = self._cwd / "hints"
+            if hints_dir.is_dir() and (hints_dir / "__init__.py").is_file():
+                try:
+                    import importlib.util
+
+                    spec = importlib.util.spec_from_file_location(
+                        "hints",
+                        hints_dir / "__init__.py",
+                        submodule_search_locations=[str(hints_dir)],
+                    )
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        sys.modules["hints"] = mod
+                        spec.loader.exec_module(mod)
+
+                        from claudechic.sessions import count_sessions
+
+                        await mod.evaluate(
+                            send_notification=self.notify,
+                            project_root=self._cwd,
+                            session_count=count_sessions(self._cwd),
+                            is_startup=is_startup,
+                            budget=budget,
+                        )
+                except Exception:
+                    log.debug("Template-side hints failed", exc_info=True)
+
+            if hint_specs:
+                await run_pipeline(
+                    send_notification=self.notify,
+                    project_state=project_state,
+                    state_store=state_store,
+                    activation=activation,
+                    hints=hint_specs,
+                    budget=budget,
+                    is_startup=is_startup,
+                )
         except Exception:
             # IRON RULE: hints must never crash ClaudeChic
             log.debug("Hints evaluation failed", exc_info=True)
@@ -1096,6 +1118,248 @@ class ChatApp(App):
         """Trigger periodic hints evaluation (1 toast max, non-startup delays)."""
         from claudechic.tasks import create_safe_task
         create_safe_task(self._run_hints(is_startup=False, budget=1), name="hints-periodic")
+
+    # --- Workflow guidance system ---
+
+    def _init_workflow_infrastructure(self) -> None:
+        """Initialize workflow guidance infrastructure (called from on_mount).
+
+        Creates ManifestLoader, HitLogger, OverrideTokenStore. These are
+        independent of whether any workflow is active — global rules and
+        the ack mechanism need them always.
+        """
+        try:
+            from claudechic.guardrails.hits import HitLogger
+            from claudechic.guardrails.tokens import OverrideTokenStore
+            from claudechic.workflows.loader import ManifestLoader
+
+            self._token_store = OverrideTokenStore()
+            self._hit_logger = HitLogger(self._cwd / ".claude" / "hits.jsonl")
+            self._manifest_loader = ManifestLoader(
+                global_dir=self._cwd / "global",
+                workflows_dir=self._cwd / "workflows",
+            )
+            # Parsers are registered by the loader at load() time via
+            # built-in defaults. External parsers can also be registered
+            # before the first load() call.
+        except Exception:
+            log.debug("Workflow infrastructure init failed", exc_info=True)
+
+    def _discover_workflows(self) -> None:
+        """Parse all manifests, build workflow registry.
+
+        Called at startup and on /workflow reload. Registers valid
+        workflows for slash command activation.
+        """
+        if not self._manifest_loader:
+            return
+
+        try:
+            self._load_result = self._manifest_loader.load()
+
+            # Surface parse errors as toasts (not app failures)
+            for error in self._load_result.errors:
+                self.notify(
+                    f"Manifest: {error.message}",
+                    severity="warning",
+                    timeout=0,  # Persistent — parse errors must stay visible
+                )
+
+            # Build registry of valid workflows (no parse errors)
+            self._workflow_registry = {}
+            for wf_id, wf_data in self._load_result.workflows.items():
+                if wf_data.has_errors:
+                    log.warning(
+                        "Workflow '%s' has errors, skipping command registration",
+                        wf_id,
+                    )
+                    continue
+                self._workflow_registry[wf_id] = wf_data.path
+
+            if self._workflow_registry:
+                log.info(
+                    "Discovered workflows: %s",
+                    ", ".join(self._workflow_registry),
+                )
+        except Exception:
+            log.debug("Workflow discovery failed", exc_info=True)
+
+    async def _activate_workflow(self, workflow_id: str) -> None:
+        """Activate a workflow — create engine, start first phase."""
+        if workflow_id not in self._workflow_registry:
+            self.notify(f"Unknown workflow: {workflow_id}", severity="error")
+            return
+
+        if self._workflow_engine:
+            self.notify(
+                "Deactivate current workflow first "
+                f"(/{self._workflow_engine.workflow_id} stop)",
+                severity="warning",
+            )
+            return
+
+        if not self._load_result:
+            self.notify("No manifests loaded", severity="error")
+            return
+
+        wf_data = self._load_result.get_workflow(workflow_id)
+        if not wf_data:
+            self.notify(f"Workflow data not found: {workflow_id}", severity="error")
+            return
+
+        try:
+            from claudechic.workflows.engine import WorkflowEngine, WorkflowManifest
+
+            # Construct manifest from LoadResult phases filtered by namespace
+            wf_phases = [
+                p for p in self._load_result.phases if p.namespace == workflow_id
+            ]
+            manifest = WorkflowManifest(workflow_id=workflow_id, phases=wf_phases)
+
+            self._workflow_engine = WorkflowEngine(
+                manifest=manifest,
+                persist_fn=self._make_persist_fn(),
+                confirm_callback=self._make_confirm_callback(),
+            )
+            phase = self._workflow_engine.get_current_phase()
+            self.notify(
+                f"Workflow '{workflow_id}' activated — phase: {phase or 'none'}"
+            )
+        except Exception as e:
+            log.warning("Failed to activate workflow '%s': %s", workflow_id, e)
+            self.notify(f"Failed to activate workflow: {e}", severity="error")
+
+    def _deactivate_workflow(self) -> None:
+        """Deactivate current workflow. Destroys engine, clears state."""
+        if not self._workflow_engine:
+            self.notify("No active workflow", severity="warning")
+            return
+
+        wf_id = self._workflow_engine.workflow_id
+        self._workflow_engine = None
+
+        # Clear workflow_state from chicsession if present
+        if self._chicsession_name:
+            try:
+                from claudechic.chicsession_cmd import _get_manager
+
+                mgr = _get_manager()
+                cs = mgr.load(self._chicsession_name)
+                cs.workflow_state = None
+                mgr.save(cs)
+            except Exception:
+                log.debug("Failed to clear workflow state from chicsession", exc_info=True)
+
+        self.notify(f"Workflow '{wf_id}' deactivated")
+
+    def _make_persist_fn(self):
+        """Create callback for engine to persist workflow state via chicsession."""
+
+        async def persist(state: dict) -> None:
+            if not self._chicsession_name:
+                return
+            try:
+                from claudechic.chicsession_cmd import _get_manager
+
+                mgr = _get_manager()
+                cs = mgr.load(self._chicsession_name)
+                cs.workflow_state = state
+                mgr.save(cs)
+            except Exception:
+                log.debug("Failed to persist workflow state", exc_info=True)
+
+        return persist
+
+    def _make_confirm_callback(self):
+        """Create async confirm callback for ManualConfirm checks."""
+
+        async def confirm(message: str) -> bool:
+            return await self._show_override_prompt("advance-check", message)
+
+        return confirm
+
+    def _restore_workflow_from_session(self) -> None:
+        """Restore workflow engine from chicsession on session resume."""
+        if not self._chicsession_name:
+            return
+
+        try:
+            from claudechic.chicsession_cmd import _get_manager
+
+            mgr = _get_manager()
+            cs = mgr.load(self._chicsession_name)
+            if not cs.workflow_state:
+                return
+
+            wf_id = cs.workflow_state.get("workflow_id")
+            if not wf_id or wf_id not in self._workflow_registry:
+                return
+
+            if not self._load_result:
+                return
+
+            from claudechic.workflows.engine import WorkflowEngine, WorkflowManifest
+
+            # Construct manifest from LoadResult phases filtered by namespace
+            wf_phases = [
+                p for p in self._load_result.phases if p.namespace == wf_id
+            ]
+            manifest = WorkflowManifest(workflow_id=wf_id, phases=wf_phases)
+
+            self._workflow_engine = WorkflowEngine.from_session_state(
+                state=cs.workflow_state,
+                manifest=manifest,
+                persist_fn=self._make_persist_fn(),
+                confirm_callback=self._make_confirm_callback(),
+            )
+            phase = self._workflow_engine.get_current_phase()
+            self.notify(f"Restored workflow '{wf_id}' — phase: {phase or 'none'}")
+        except Exception:
+            log.debug("Failed to restore workflow from session", exc_info=True)
+
+    async def _handle_workflow_command(self, cmd: str, args: str) -> bool:
+        """Handle workflow-related slash commands. Returns True if handled."""
+        # /workflow list
+        if cmd == "/workflow" and args.strip() == "list":
+            lines = ["Discovered workflows:"]
+            for wf_id, wf_path in sorted(self._workflow_registry.items()):
+                status = "active" if (
+                    self._workflow_engine
+                    and self._workflow_engine.workflow_id == wf_id
+                ) else "available"
+                lines.append(f"  {wf_id} [{status}] — {wf_path}")
+            if not self._workflow_registry:
+                lines.append("  (none)")
+            self._show_system_info("\n".join(lines), "info", None)
+            return True
+
+        # /workflow reload
+        if cmd == "/workflow" and args.strip() == "reload":
+            self._discover_workflows()
+            self._show_system_info(
+                f"Reloaded manifests. {len(self._workflow_registry)} workflow(s) available.",
+                "info",
+                None,
+            )
+            return True
+
+        # /{workflow-id} stop
+        for wf_id in self._workflow_registry:
+            wf_cmd = f"/{wf_id}"
+            if cmd == wf_cmd:
+                if args.strip() == "stop":
+                    self._deactivate_workflow()
+                else:
+                    await self._activate_workflow(wf_id)
+                return True
+
+        return False
+
+    def _close_workflow_resources(self) -> None:
+        """Clean up workflow resources on app shutdown."""
+        if self._hit_logger:
+            self._hit_logger.close()
+            self._hit_logger = None
 
     _review_poll_timer: Timer | None = None
     _review_poll_agent_id: str | None = None  # agent that owns the poll timer
@@ -1872,6 +2136,9 @@ class ChatApp(App):
         Args:
             reason: Why the app is closing (quit, crash, error)
         """
+        # Close workflow resources (hit logger, etc.)
+        self._close_workflow_resources()
+
         # Close all agents in parallel (fires agent_closed events with message_count)
         if self.agent_mgr:
             await self.agent_mgr.close_all()

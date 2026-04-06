@@ -115,6 +115,7 @@ COMMANDS: list[tuple[str, str, list[str]]] = [
     ("/reviewer", "Spawn a review agent for current changes", []),
     ("/plan-swarm", "Start swarm planning with multiple approaches", []),
     ("/rewind", "Rewind to a previous checkpoint", []),
+    ("/workflow", "Manage workflows", ["/workflow list", "/workflow reload"]),
     ("/help", "Show help", []),
     ("/exit", "Quit", []),
     ("!<cmd>", "Shell command alias", []),
@@ -305,6 +306,25 @@ def handle_command(app: "ChatApp", prompt: str) -> bool:
     if cmd == "/rewind" or cmd.startswith("/rewind "):
         _track_command(app, "rewind")
         return _handle_rewind(app, cmd)
+
+    # Workflow commands: /workflow list|reload, /{workflow-id} [stop]
+    if cmd.startswith("/workflow"):
+        _track_command(app, "workflow")
+        parts = cmd.split(maxsplit=1)
+        args = parts[1] if len(parts) > 1 else ""
+        app.run_worker(app._handle_workflow_command("/workflow", args))
+        return True
+
+    # Check dynamic workflow activation commands (/{workflow-id} or /{workflow-id} stop)
+    if hasattr(app, "_workflow_registry") and app._workflow_registry:
+        cmd_name = cmd.split()[0]
+        for wf_id in app._workflow_registry:
+            if cmd_name == f"/{wf_id}":
+                _track_command(app, f"workflow:{wf_id}")
+                parts = cmd.split(maxsplit=1)
+                args = parts[1] if len(parts) > 1 else ""
+                app.run_worker(app._handle_workflow_command(cmd_name, args))
+                return True
 
     # Unknown slash command - pass through to Claude (may be SDK command or skill)
     cmd_name = cmd.split()[0]
