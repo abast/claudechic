@@ -1230,6 +1230,20 @@ class ChatApp(App):
                 main_role=wf_data.main_role,
             )
 
+            # Prompt user to name/resume a chicsession so workflow state is
+            # persisted.  Must happen BEFORE creating the engine, because
+            # the engine's persist_fn checks self._chicsession_name and
+            # exits early if it is None.
+            if not self._chicsession_name:
+                session_name = await self._prompt_chicsession_name(workflow_id)
+                if session_name is None:
+                    # User cancelled the prompt — abort workflow activation
+                    self.notify(
+                        f"Workflow '{workflow_id}' activation cancelled",
+                        severity="warning",
+                    )
+                    return
+
             self._workflow_engine = WorkflowEngine(
                 manifest=manifest,
                 persist_fn=self._make_persist_fn(),
@@ -1248,6 +1262,136 @@ class ChatApp(App):
         except Exception as e:
             log.warning("Failed to activate workflow '%s': %s", workflow_id, e)
             self.notify(f"Failed to activate workflow: {e}", severity="error")
+
+    async def _prompt_chicsession_name(self, workflow_id: str) -> str | None:
+        """Prompt the user to name or resume a chicsession for workflow activation.
+
+        Shows a TUI prompt with:
+        - Existing chicsessions to resume (if any)
+        - A text input option to create a new session (default: workflow_id)
+
+        Returns the chosen session name, or None if the user cancelled.
+        Sets self._chicsession_name and creates/loads the session on disk.
+        """
+        from claudechic.chicsession_cmd import (
+            _get_manager,
+            _update_sidebar_label,
+        )
+        from claudechic.chicsessions import Chicsession, ChicsessionEntry
+        from claudechic.widgets.prompts import SelectionPrompt
+
+        mgr = _get_manager()
+        existing = mgr.list_chicsessions()
+
+        # Build prompt options: existing sessions first, then "New session"
+        options: list[tuple[str, str]] = []
+        for name in existing:
+            try:
+                cs = mgr.load(name)
+                agent_count = len(cs.agents)
+                agent_names = ", ".join(a.name for a in cs.agents[:4])
+                if len(cs.agents) > 4:
+                    agent_names += ", ..."
+                wf_label = ""
+                if cs.workflow_state and cs.workflow_state.get("workflow_id") == workflow_id:
+                    wf_label = " [matching workflow]"
+                options.append((
+                    f"resume:{name}",
+                    f"Resume '{name}' ({agent_count} agent{'s' if agent_count != 1 else ''}: {agent_names}){wf_label}",
+                ))
+            except (ValueError, FileNotFoundError):
+                options.append((
+                    f"resume:{name}",
+                    f"Resume '{name}' (corrupt/empty)",
+                ))
+
+        title = f"Name this session for workflow '{workflow_id}'"
+        text_option = ("new", f"New session (default: {workflow_id})")
+
+        prompt = SelectionPrompt(title, options, text_option=text_option)
+
+        try:
+            async with self._show_prompt(prompt):
+                result = await prompt.wait()
+        except Exception as e:
+            log.warning("Chicsession prompt failed: %s", e)
+            return None
+
+        if not result:
+            # User cancelled (pressed Escape)
+            return None
+
+        if result.startswith("resume:"):
+            # Resume existing session
+            session_name = result[len("resume:"):]
+            try:
+                mgr.load(session_name)  # Validate it loads
+                self._chicsession_name = session_name
+                _update_sidebar_label(self, session_name)
+                log.info(
+                    "Resumed existing chicsession '%s' for workflow activation",
+                    session_name,
+                )
+                return session_name
+            except (FileNotFoundError, ValueError) as exc:
+                log.warning("Failed to load chicsession '%s': %s", session_name, exc)
+                self.notify(
+                    f"Could not load session '{session_name}': {exc}",
+                    severity="error",
+                )
+                return None
+
+        # New session — extract name from text input or use default
+        if result.startswith("new:"):
+            session_name = result[len("new:"):].strip()
+        elif result == "new":
+            session_name = ""
+        else:
+            session_name = ""
+
+        if not session_name:
+            session_name = workflow_id
+
+        # Create fresh session
+        entries: list[ChicsessionEntry] = []
+        active_name = "main"
+        if self.agent_mgr:
+            for agent in self.agent_mgr.agents.values():
+                if agent.session_id:
+                    entries.append(
+                        ChicsessionEntry(
+                            name=agent.name,
+                            session_id=agent.session_id,
+                            cwd=str(agent.cwd),
+                        )
+                    )
+            active = self.agent_mgr.active
+            if active:
+                active_name = active.name
+            elif entries:
+                active_name = entries[0].name
+
+        cs = Chicsession(
+            name=session_name,
+            active_agent=active_name,
+            agents=entries,
+        )
+        try:
+            mgr.save(cs)
+            self._chicsession_name = session_name
+            _update_sidebar_label(self, session_name)
+            log.info(
+                "Created chicsession '%s' for workflow activation",
+                session_name,
+            )
+            return session_name
+        except Exception:
+            log.warning(
+                "Failed to create chicsession '%s'",
+                session_name,
+                exc_info=True,
+            )
+            return None
 
     def _inject_phase_prompt_to_main_agent(
         self,
@@ -1311,6 +1455,13 @@ class ChatApp(App):
                 mgr.save(cs)
             except Exception:
                 log.debug("Failed to clear workflow state from chicsession", exc_info=True)
+
+            # Clear the session name so that activating a different workflow
+            # won't persist its state to the old workflow's session file.
+            from claudechic.chicsession_cmd import _update_sidebar_label
+
+            self._chicsession_name = None
+            _update_sidebar_label(self, None)
 
         self.notify(f"Workflow '{wf_id}' deactivated")
 

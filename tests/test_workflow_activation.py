@@ -34,6 +34,12 @@ def _setup_workflow(root: Path) -> None:
     (wf_dir / "my_proj.yaml").write_text(yaml.dump(wf_manifest))
 
 
+async def _mock_prompt_chicsession_name(self, workflow_id: str) -> str | None:
+    """Test stub: skip TUI prompt, return workflow_id as session name."""
+    self._chicsession_name = workflow_id
+    return workflow_id
+
+
 class TestWorkflowActivation:
     """Real ChatApp E2E tests for workflow slash commands."""
 
@@ -48,6 +54,9 @@ class TestWorkflowActivation:
             )
             stack.enter_context(
                 patch("claudechic.sessions.count_sessions", return_value=1)
+            )
+            stack.enter_context(
+                patch.object(ChatApp, "_prompt_chicsession_name", _mock_prompt_chicsession_name)
             )
 
             async with app.run_test(size=(120, 40), notifications=True) as pilot:
@@ -79,6 +88,9 @@ class TestWorkflowActivation:
             )
             stack.enter_context(
                 patch("claudechic.sessions.count_sessions", return_value=1)
+            )
+            stack.enter_context(
+                patch.object(ChatApp, "_prompt_chicsession_name", _mock_prompt_chicsession_name)
             )
 
             async with app.run_test(size=(120, 40), notifications=True) as pilot:
@@ -152,6 +164,9 @@ class TestWorkflowActivation:
             )
             stack.enter_context(
                 patch("claudechic.sessions.count_sessions", return_value=1)
+            )
+            stack.enter_context(
+                patch.object(ChatApp, "_prompt_chicsession_name", _mock_prompt_chicsession_name)
             )
 
             async with app.run_test(size=(120, 40), notifications=True) as pilot:

@@ -52,6 +52,12 @@ def _setup_workflow_with_phases(root: Path, add_check_file: bool = False) -> Non
         (root / "README.md").write_text("# Project\n")
 
 
+async def _mock_prompt_chicsession_name(self, workflow_id: str) -> str | None:
+    """Test stub: skip TUI prompt, return workflow_id as session name."""
+    self._chicsession_name = workflow_id
+    return workflow_id
+
+
 class TestWorkflowPhases:
     """Real ChatApp E2E tests for phase lifecycle."""
 
@@ -66,6 +72,9 @@ class TestWorkflowPhases:
             )
             stack.enter_context(
                 patch("claudechic.sessions.count_sessions", return_value=1)
+            )
+            stack.enter_context(
+                patch.object(ChatApp, "_prompt_chicsession_name", _mock_prompt_chicsession_name)
             )
 
             async with app.run_test(size=(120, 40), notifications=True) as pilot:
@@ -106,6 +115,9 @@ class TestWorkflowPhases:
             stack.enter_context(
                 patch("claudechic.sessions.count_sessions", return_value=1)
             )
+            stack.enter_context(
+                patch.object(ChatApp, "_prompt_chicsession_name", _mock_prompt_chicsession_name)
+            )
 
             async with app.run_test(size=(120, 40), notifications=True) as pilot:
                 await pilot.pause()
@@ -141,6 +153,9 @@ class TestWorkflowPhases:
             )
             stack.enter_context(
                 patch("claudechic.sessions.count_sessions", return_value=1)
+            )
+            stack.enter_context(
+                patch.object(ChatApp, "_prompt_chicsession_name", _mock_prompt_chicsession_name)
             )
 
             async with app.run_test(size=(120, 40), notifications=True) as pilot:
@@ -178,6 +193,9 @@ class TestWorkflowPhases:
             )
             stack.enter_context(
                 patch("claudechic.sessions.count_sessions", return_value=1)
+            )
+            stack.enter_context(
+                patch.object(ChatApp, "_prompt_chicsession_name", _mock_prompt_chicsession_name)
             )
 
             async with app.run_test(size=(120, 40), notifications=True) as pilot:
