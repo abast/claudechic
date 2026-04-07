@@ -1264,9 +1264,19 @@ class ChatApp(App):
             # Send a short kick-off message so the agent responds.
             # Full phase instructions are in .claude/phase_context.md.
             self._send_to_active_agent(
-                f"Workflow '{workflow_id}' activated — phase: {phase or 'none'}. "
-                "Please read .claude/phase_context.md for your instructions, "
-                "then greet the user and guide them on what to do next."
+                f"Workflow '{workflow_id}' activated — you are in phase: "
+                f"{phase or 'none'}.\n\n"
+                "Explain to the user:\n"
+                "- A workflow is a guided, multi-phase process that structures "
+                "how you work together. Each phase has its own rules, checks, "
+                "and instructions.\n"
+                f"- This is the '{workflow_id}' workflow — "
+                "an example to learn how the system works.\n"
+                f"- We are currently in the '{phase or 'none'}' phase.\n"
+                "- They can check the current phase anytime using the "
+                "`get_phase` MCP tool, and advance with `advance_phase`.\n\n"
+                "Read .claude/phase_context.md for your full phase instructions, "
+                "then greet the user and guide them on what to do in this phase."
             )
         except Exception as e:
             log.warning("Failed to activate workflow '%s': %s", workflow_id, e)
