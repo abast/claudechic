@@ -106,6 +106,8 @@ def _clear_pending_reply_if_matched(
     if sender and sender._pending_reply_to == recipient_name:
         sender._pending_reply_to = None
         sender._reply_nudge_count = 0
+        # Bump generation to invalidate any pending nudge timers
+        sender._nudge_generation += 1
         log.debug(
             "Agent '%s' fulfilled reply obligation to '%s'", sender_name, recipient_name
         )
@@ -188,6 +190,34 @@ def _make_spawn_agent(caller_name: str | None = None):
         agent_type = args.get("type")
         requires_answer = args.get("requires_answer", False)
 
+        # BUG #2 fix: When type is provided and a workflow is active,
+        # validate that the role folder exists.  The `type` parameter is
+        # the explicit link to the workflow role system — we never infer
+        # it from the agent name (that's fragile).  If type is not
+        # provided, the agent gets no role wiring (generic agent).
+        if agent_type and _app._workflow_engine:
+            try:
+                from claudechic.workflows.agent_folders import _find_workflow_dir
+
+                wf_dir = _find_workflow_dir(
+                    Path.cwd() / "workflows",
+                    _app._workflow_engine.workflow_id,
+                )
+                if wf_dir and not (wf_dir / agent_type).is_dir():
+                    available = sorted(
+                        d.name
+                        for d in wf_dir.iterdir()
+                        if d.is_dir() and not d.name.startswith(".")
+                    )
+                    roles_list = ", ".join(available) if available else "(none found)"
+                    return _error_response(
+                        f"Role '{agent_type}' not found in workflow "
+                        f"'{_app._workflow_engine.workflow_id}'. "
+                        f"Available roles: {roles_list}"
+                    )
+            except Exception:
+                pass  # Best-effort check, don't block spawn
+
         # Inherit caller's model if not explicitly specified
         caller_model = None
         if caller_name:
@@ -224,8 +254,31 @@ def _make_spawn_agent(caller_name: str | None = None):
         result = f"Created agent '{name}' in {path}"
 
         if prompt:
+            # Inject agent folder prompt at spawn time if workflow is active
+            full_prompt = prompt
+            if _app._workflow_engine:
+                try:
+                    from claudechic.workflows.agent_folders import (
+                        assemble_phase_prompt,
+                    )
+
+                    folder_prompt = assemble_phase_prompt(
+                        workflows_dir=Path.cwd() / "workflows",
+                        workflow_id=_app._workflow_engine.workflow_id,
+                        role_name=agent_type or name,
+                        current_phase=_app._workflow_engine.get_current_phase(),
+                    )
+                    if folder_prompt:
+                        full_prompt = f"{folder_prompt}\n\n---\n\n{prompt}"
+                except Exception:
+                    log.debug(
+                        "Agent folder prompt assembly failed for '%s'",
+                        name,
+                        exc_info=True,
+                    )
+
             _send_prompt_fire_and_forget(
-                agent, prompt, caller_name=caller_name, is_spawn=True
+                agent, full_prompt, caller_name=caller_name, is_spawn=True
             )
             result += f"\nQueued initial prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}"
 
@@ -308,9 +361,8 @@ def _make_ask_agent(caller_name: str | None = None):
         # follow-up question, not a final answer. The obligation is only
         # fulfilled when the agent uses tell_agent to deliver a result.
 
-        return _text_response(
-            f"Question queued for '{name}'. Delivery is asynchronous - the message may not arrive if the agent is disconnected."
-        )
+        preview = prompt[:80] + "..." if len(prompt) > 80 else prompt
+        return _text_response(f"→ {name}: {preview}")
 
     return ask_agent
 
@@ -341,7 +393,8 @@ def _make_tell_agent(caller_name: str | None = None):
         # Clear pending reply if this agent is replying to its caller
         _clear_pending_reply_if_matched(caller_name, name)
 
-        return _text_response(f"Message queued for '{name}'. Delivery is asynchronous.")
+        preview = message[:80] + "..." if len(message) > 80 else message
+        return _text_response(f"→ {name}: {preview}")
 
     return tell_agent
 
@@ -631,6 +684,219 @@ def discover_mcp_tools(mcp_tools_dir: Path, **kwargs) -> list:
     return tools
 
 
+def _format_tool_input(tool_input: dict) -> str:
+    """Format tool_input dict for display in override prompts."""
+    import json
+
+    try:
+        return json.dumps(tool_input, indent=2, default=str)[:500]
+    except Exception:
+        return str(tool_input)[:500]
+
+
+# --- Workflow MCP tools ---
+
+
+@tool(
+    "advance_phase",
+    "Advance the active workflow to its next phase. Engine runs advance_checks (AND semantics, short-circuit). Returns whether the transition succeeded.",
+    {},
+)
+async def advance_phase(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+    """Attempt to advance the active workflow to its next phase."""
+    if _app is None or _app._workflow_engine is None:
+        return _error_response("No active workflow")
+    _track_mcp_tool("advance_phase")
+
+    engine = _app._workflow_engine
+    current = engine.get_current_phase()
+    if current is None:
+        return _error_response("No current phase set")
+
+    next_phase = engine.get_next_phase(current)
+    if next_phase is None:
+        return _error_response(f"No phase after '{current}' — already at final phase")
+
+    result = await engine.attempt_phase_advance(
+        workflow_id=engine.workflow_id,
+        current_phase=current,
+        next_phase=next_phase,
+        advance_checks=engine.get_advance_checks_for(current),
+    )
+
+    if result.success:
+        # Build phase prompt content synchronously so the calling agent
+        # gets the new phase instructions in the tool response (not later
+        # via async broadcast, which caused BUG #1: late/out-of-order
+        # phase injections).
+        phase_content = ""
+        main_role = getattr(engine.manifest, "main_role", None)
+        if main_role:
+            try:
+                from claudechic.workflows.agent_folders import assemble_phase_prompt
+
+                phase_content = assemble_phase_prompt(
+                    workflows_dir=Path.cwd() / "workflows",
+                    workflow_id=engine.workflow_id,
+                    role_name=main_role,
+                    current_phase=next_phase,
+                ) or ""
+            except Exception:
+                log.debug("Failed to assemble phase prompt for advance_phase response", exc_info=True)
+
+            # Still broadcast to OTHER agents asynchronously so they get
+            # the phase update too (the caller already has it inline).
+            _app._inject_phase_prompt_to_main_agent(
+                engine.workflow_id, main_role, next_phase
+            )
+
+        response = f"Advanced to phase: {next_phase}"
+        if phase_content:
+            response += f"\n\n--- Phase Instructions ---\n\n{phase_content}"
+        return _text_response(response)
+    else:
+        return _error_response(f"Advance blocked: {result.reason}")
+
+
+@tool(
+    "get_phase",
+    "Get the current workflow state: active workflow, phase, phase list, loaded rules/injections, and errors. In-memory lookup, no file I/O.",
+    {},
+)
+async def get_phase(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+    """Get current workflow state with full diagnostic info."""
+    if _app is None:
+        return _text_response("No app context.")
+    _track_mcp_tool("get_phase")
+
+    lines: list[str] = []
+
+    # Workflow engine state
+    engine = getattr(_app, "_workflow_engine", None)
+    if engine is None:
+        lines.append("Workflow: none active")
+    else:
+        current = engine.get_current_phase()
+        next_phase = engine.get_next_phase(current) if current else None
+        phase_order = engine._phase_order
+
+        lines.append(f"Workflow: {engine.workflow_id}")
+        lines.append(f"Phase: {current or '(none)'}")
+        if next_phase:
+            lines.append(f"Next phase: {next_phase}")
+        if phase_order:
+            idx = phase_order.index(current) + 1 if current and current in phase_order else 0
+            lines.append(f"Progress: {idx}/{len(phase_order)} ({', '.join(phase_order)})")
+
+    # Manifest loader state
+    loader = getattr(_app, "_manifest_loader", None)
+    if loader:
+        result = loader.load()
+        lines.append(f"Rules: {len(result.rules)}")
+        lines.append(f"Injections: {len(result.injections)}")
+        if result.injections:
+            for inj in result.injections:
+                phases_str = f" phases={inj.phases}" if inj.phases else ""
+                lines.append(f"  - {inj.id} [{', '.join(inj.trigger)}]{phases_str}")
+        if result.errors:
+            lines.append(f"Errors: {len(result.errors)}")
+            for err in result.errors[:5]:
+                lines.append(f"  - {err.source}: {err.message}")
+    else:
+        lines.append("Loader: not initialized")
+
+    return _text_response("\n".join(lines))
+
+
+@tool(
+    "request_override",
+    "Request user approval to override a deny-level rule. User sees the exact command. If approved, stores a one-time token — retry the exact same command to execute it.",
+    {
+        "type": "object",
+        "properties": {
+            "rule_id": {
+                "type": "string",
+                "description": "The qualified ID of the blocking rule (from block message)",
+            },
+            "tool_name": {
+                "type": "string",
+                "description": "The tool that was blocked",
+            },
+            "tool_input": {
+                "type": "object",
+                "description": "The exact tool input dict that was blocked",
+            },
+        },
+        "required": ["rule_id", "tool_name", "tool_input"],
+    },
+)
+async def request_override(args: dict[str, Any]) -> dict[str, Any]:
+    """Request user approval to override a deny-level rule."""
+    if _app is None or _app._token_store is None:
+        return _error_response("App not initialized")
+    _track_mcp_tool("request_override")
+
+    rule_id = args["rule_id"]
+    tool_name = args["tool_name"]
+    tool_input = args.get("tool_input", {})
+
+    description = (
+        f"Agent wants to run blocked action:\n"
+        f"  Tool: {tool_name}\n"
+        f"  Input: {_format_tool_input(tool_input)}\n"
+        f"  Blocked by: {rule_id}\n"
+        f"Approve this specific action?"
+    )
+
+    approved = await _app._show_override_prompt(rule_id, description)
+
+    if approved:
+        _app._token_store.store(rule_id, tool_name, tool_input, enforcement="deny")
+        return _text_response(
+            f"Override approved for rule {rule_id}. Retry the exact same command."
+        )
+    else:
+        return _text_response("Override denied.")
+
+
+@tool(
+    "acknowledge_warning",
+    "Acknowledge a warn-level rule to proceed past it. Stores a one-time token. Retry the exact same command to execute it. No user interaction required.",
+    {
+        "type": "object",
+        "properties": {
+            "rule_id": {
+                "type": "string",
+                "description": "The qualified ID of the warning rule (from block message)",
+            },
+            "tool_name": {
+                "type": "string",
+                "description": "The tool that was blocked",
+            },
+            "tool_input": {
+                "type": "object",
+                "description": "The exact tool input dict that was blocked",
+            },
+        },
+        "required": ["rule_id", "tool_name", "tool_input"],
+    },
+)
+async def acknowledge_warning(args: dict[str, Any]) -> dict[str, Any]:
+    """Acknowledge a warn-level rule to proceed past it."""
+    if _app is None or _app._token_store is None:
+        return _error_response("App not initialized")
+    _track_mcp_tool("acknowledge_warning")
+
+    rule_id = args["rule_id"]
+    tool_name = args["tool_name"]
+    tool_input = args.get("tool_input", {})
+
+    _app._token_store.store(rule_id, tool_name, tool_input, enforcement="warn")
+    return _text_response(
+        f"Warning acknowledged for rule {rule_id}. Retry the exact same command."
+    )
+
+
 def create_chic_server(caller_name: str | None = None):
     """Create the chic MCP server with all tools.
 
@@ -646,6 +912,11 @@ def create_chic_server(caller_name: str | None = None):
         _make_whoami(caller_name),
         list_agents,
         _make_close_agent(caller_name),
+        # Workflow guidance tools
+        advance_phase,
+        get_phase,
+        request_override,
+        acknowledge_warning,
     ]
 
     # finish_worktree is experimental - enable with experimental.finish_worktree: true

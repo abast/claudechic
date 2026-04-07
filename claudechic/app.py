@@ -221,6 +221,14 @@ class ChatApp(App):
         # Active chicsession name — when set, agent create/close auto-saves
         self._chicsession_name: str | None = None
 
+        # Workflow guidance system — initialized in on_mount()
+        self._manifest_loader: Any = None  # ManifestLoader
+        self._hit_logger: Any = None  # HitLogger
+        self._token_store: Any = None  # OverrideTokenStore
+        self._load_result: Any = None  # LoadResult
+        self._workflow_registry: dict[str, Path] = {}  # workflow_id -> directory
+        self._workflow_engine: Any = None  # WorkflowEngine
+
     def _fatal_error(self) -> None:
         """Override to use plain Python tracebacks instead of rich's fancy ones."""
         import traceback
@@ -630,6 +638,82 @@ class ChatApp(App):
             "PreToolUse": [HookMatcher(matcher=None, hooks=[block_mutating_tools])],  # type: ignore[arg-type]
         }
 
+    def _guardrail_hooks(self, agent_role: str | None = None) -> "dict[HookEvent, list[HookMatcher]]":
+        """Create PreToolUse hooks that evaluate rules from manifests.
+
+        Delegates to create_guardrail_hooks() in guardrails/hooks.py.
+        Two-step pipeline: injections first, then enforcement (log/warn/deny).
+        """
+        if not self._manifest_loader or not self._hit_logger or not self._token_store:
+            return {}
+
+        from claudechic.guardrails.hooks import create_guardrail_hooks
+
+        return create_guardrail_hooks(
+            loader=self._manifest_loader,
+            hit_logger=self._hit_logger,
+            agent_role=agent_role,
+            get_phase=lambda: (
+                self._workflow_engine.get_current_phase()
+                if self._workflow_engine
+                else None
+            ),
+            get_active_wf=lambda: (
+                self._workflow_engine.workflow_id
+                if self._workflow_engine
+                else None
+            ),
+            consume_override=self._token_store.consume,
+        )
+
+    async def _show_override_prompt(self, rule_id: str, description: str) -> bool:
+        """Show override approval prompt for deny-level rules.
+
+        Used by the request_override MCP tool. User sees the exact
+        command details and approves/denies the specific action.
+        Returns True if user allows.
+        """
+        from claudechic.widgets.prompts import SelectionPrompt
+
+        try:
+            options = [
+                ("allow", "Allow — approve this specific action"),
+                ("deny", "Deny — block this action"),
+            ]
+            title = f"\U0001f6e1\ufe0f Override request: {rule_id}"
+            prompt = SelectionPrompt(title, options)
+
+            async with self._show_prompt(prompt):
+                result = await prompt.wait()
+
+            return result == "allow"
+        except Exception as e:
+            log.warning("Override prompt error for %s: %s", rule_id, e)
+            return False  # Deny on error
+
+    def _merged_hooks(self, agent_type: str | None = None) -> "dict[HookEvent, list[HookMatcher]]":
+        """Merge plan-mode hooks, guardrail hooks, and PostCompact hook."""
+        hooks = self._plan_mode_hooks()
+
+        # Rule-evaluation hooks (extracted to guardrails/hooks.py)
+        guardrail_hooks = self._guardrail_hooks(agent_role=agent_type)
+        for event, matchers in guardrail_hooks.items():
+            hooks.setdefault(event, []).extend(matchers)
+
+        # PostCompact hook — re-injects phase context after /compact
+        if self._workflow_engine:
+            from claudechic.workflows.agent_folders import create_post_compact_hook
+
+            compact_hooks = create_post_compact_hook(
+                engine=self._workflow_engine,
+                agent_role=agent_type or "",
+                workflows_dir=self._cwd / "workflows",
+            )
+            for event, matchers in compact_hooks.items():
+                hooks.setdefault(event, []).extend(matchers)
+
+        return hooks
+
     def _make_options(
         self,
         cwd: Path | None = None,
@@ -676,7 +760,7 @@ class ChatApp(App):
             mcp_servers={"chic": create_chic_server(caller_name=agent_name)},
             include_partial_messages=True,
             stderr=self._handle_sdk_stderr,
-            hooks=self._plan_mode_hooks(),
+            hooks=self._merged_hooks(agent_type=agent_type),
             enable_file_checkpointing=True,
             extra_args={"replay-user-messages": None},
         )
@@ -713,6 +797,12 @@ class ChatApp(App):
         # Register app for MCP tools
         set_app(self)
 
+        # Set cwd early — needed by workflow infrastructure and file index
+        self._cwd = Path.cwd()
+
+        # Initialize workflow guidance infrastructure
+        self._init_workflow_infrastructure()
+
         # Start remote control server if requested
         if self._remote_port:
             from claudechic.remote import start_server
@@ -739,7 +829,6 @@ class ChatApp(App):
             self.agent_mgr.global_permission_mode = "bypassPermissions"
 
         # Initialize file index for fuzzy file search (doesn't need widgets)
-        self._cwd = Path.cwd()
         self.file_index = FileIndex(root=self._cwd)
         self._refresh_file_index()
 
@@ -778,6 +867,9 @@ class ChatApp(App):
         agent = self._agent
         if agent:
             self._refresh_reviews(agent)
+
+        # Discover workflow manifests and register slash commands
+        self._discover_workflows()
 
         # Connect SDK in background - UI renders while this happens
         self._connect_initial_client()
@@ -840,6 +932,9 @@ class ChatApp(App):
         if resume:
             await self._load_and_display_history(resume)
             self.notify(f"Resuming {resume[:8]}...")
+
+            # Restore workflow state from chicsession if present
+            self._restore_workflow_from_session()
 
         # Fetch SDK commands and update autocomplete
         await self._update_slash_commands()
@@ -917,6 +1012,13 @@ class ChatApp(App):
         except Exception:
             pass  # Not a git repo or git not available
 
+        # Add discovered workflow commands
+        if hasattr(self, "_workflow_registry") and self._workflow_registry:
+            for wf_id in self._workflow_registry:
+                cmd = f"/{wf_id}"
+                if cmd not in base:
+                    base.append(cmd)
+
         autocomplete.slash_commands = base
 
     @work(exclusive=True, group="file_index")
@@ -936,37 +1038,87 @@ class ChatApp(App):
         self._position_right_sidebar()
 
     async def _run_hints(self, *, is_startup: bool = True, budget: int = 2) -> None:
-        """Discover and evaluate project hints (fire-and-forget)."""
-        hints_dir = self._cwd / "hints"
-        if not hints_dir.is_dir() or not (hints_dir / "__init__.py").is_file():
-            return
-
+        """Evaluate project hints via claudechic.hints pipeline."""
         try:
-            import importlib.util
-
-            # Load hints package directly from path — no sys.path mutation.
-            # Uses submodule_search_locations so relative imports work.
-            spec = importlib.util.spec_from_file_location(
-                "hints",
-                hints_dir / "__init__.py",
-                submodule_search_locations=[str(hints_dir)],
+            from claudechic.hints import run_pipeline
+            from claudechic.hints.state import (
+                ActivationConfig,
+                HintStateStore,
+                ProjectState,
             )
-            if spec is None or spec.loader is None:
-                return
 
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["hints"] = mod
-            spec.loader.exec_module(mod)
-
-            from claudechic.sessions import count_sessions
-
-            await mod.evaluate(
-                send_notification=self.notify,
-                project_root=self._cwd,
-                session_count=count_sessions(self._cwd),
-                is_startup=is_startup,
-                budget=budget,
+            state_store = HintStateStore(self._cwd)
+            activation = ActivationConfig(state_store)
+            current_phase = (
+                self._workflow_engine.get_current_phase()
+                if self._workflow_engine
+                else None
             )
+            project_state = ProjectState.build(
+                self._cwd, current_phase=current_phase
+            )
+
+            # Collect hints from load result (manifest-declared hints)
+            hint_specs = []
+            if self._load_result:
+                from claudechic.hints.types import (
+                    AlwaysTrue,
+                    HintSpec,
+                    ShowOnce,
+                    ShowUntilResolved,
+                )
+
+                for decl in self._load_result.hints:
+                    lifecycle = ShowOnce()
+                    if decl.lifecycle == "show-until-resolved":
+                        lifecycle = ShowUntilResolved()
+                    hint_specs.append(
+                        HintSpec(
+                            id=decl.id,
+                            trigger=AlwaysTrue(),
+                            message=decl.message,
+                            lifecycle=lifecycle,
+                        )
+                    )
+
+            # Also load template-side hints if they exist (backward compat)
+            hints_dir = self._cwd / "hints"
+            if hints_dir.is_dir() and (hints_dir / "__init__.py").is_file():
+                try:
+                    import importlib.util
+
+                    spec = importlib.util.spec_from_file_location(
+                        "hints",
+                        hints_dir / "__init__.py",
+                        submodule_search_locations=[str(hints_dir)],
+                    )
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        sys.modules["hints"] = mod
+                        spec.loader.exec_module(mod)
+
+                        from claudechic.sessions import count_sessions
+
+                        await mod.evaluate(
+                            send_notification=self.notify,
+                            project_root=self._cwd,
+                            session_count=count_sessions(self._cwd),
+                            is_startup=is_startup,
+                            budget=budget,
+                        )
+                except Exception:
+                    log.debug("Template-side hints failed", exc_info=True)
+
+            if hint_specs:
+                await run_pipeline(
+                    send_notification=self.notify,
+                    project_state=project_state,
+                    state_store=state_store,
+                    activation=activation,
+                    hints=hint_specs,
+                    budget=budget,
+                    is_startup=is_startup,
+                )
         except Exception:
             # IRON RULE: hints must never crash ClaudeChic
             log.debug("Hints evaluation failed", exc_info=True)
@@ -975,6 +1127,484 @@ class ChatApp(App):
         """Trigger periodic hints evaluation (1 toast max, non-startup delays)."""
         from claudechic.tasks import create_safe_task
         create_safe_task(self._run_hints(is_startup=False, budget=1), name="hints-periodic")
+
+    # --- Workflow guidance system ---
+
+    def _init_workflow_infrastructure(self) -> None:
+        """Initialize workflow guidance infrastructure (called from on_mount).
+
+        Creates ManifestLoader, HitLogger, OverrideTokenStore. These are
+        independent of whether any workflow is active — global rules and
+        the ack mechanism need them always.
+        """
+        try:
+            from claudechic.guardrails.hits import HitLogger
+            from claudechic.guardrails.tokens import OverrideTokenStore
+            from claudechic.workflows.loader import ManifestLoader
+
+            self._token_store = OverrideTokenStore()
+            self._hit_logger = HitLogger(self._cwd / ".claude" / "hits.jsonl")
+            self._manifest_loader = ManifestLoader(
+                global_dir=self._cwd / "global",
+                workflows_dir=self._cwd / "workflows",
+            )
+            # Register all built-in section parsers before first load()
+            from claudechic.workflows import register_default_parsers
+
+            register_default_parsers(self._manifest_loader)
+        except Exception:
+            log.debug("Workflow infrastructure init failed", exc_info=True)
+
+    def _discover_workflows(self) -> None:
+        """Parse all manifests, build workflow registry.
+
+        Called at startup and on /workflow reload. Registers valid
+        workflows for slash command activation.
+        """
+        if not self._manifest_loader:
+            return
+
+        try:
+            self._load_result = self._manifest_loader.load()
+
+            # Surface parse errors as toasts (not app failures)
+            for error in self._load_result.errors:
+                self.notify(
+                    f"Manifest: {error.message}",
+                    severity="warning",
+                    timeout=0,  # Persistent — parse errors must stay visible
+                )
+
+            # Build registry of valid workflows (no parse errors)
+            self._workflow_registry = {}
+            for wf_id, wf_data in self._load_result.workflows.items():
+                if wf_data.has_errors:
+                    log.warning(
+                        "Workflow '%s' has errors, skipping command registration",
+                        wf_id,
+                    )
+                    continue
+                self._workflow_registry[wf_id] = wf_data.path
+
+            if self._workflow_registry:
+                log.info(
+                    "Discovered workflows: %s",
+                    ", ".join(self._workflow_registry),
+                )
+        except Exception:
+            log.debug("Workflow discovery failed", exc_info=True)
+
+    async def _activate_workflow(self, workflow_id: str) -> None:
+        """Activate a workflow — create engine, start first phase."""
+        if workflow_id not in self._workflow_registry:
+            self.notify(f"Unknown workflow: {workflow_id}", severity="error")
+            return
+
+        if self._workflow_engine:
+            self.notify(
+                "Deactivate current workflow first "
+                f"(/{self._workflow_engine.workflow_id} stop)",
+                severity="warning",
+            )
+            return
+
+        if not self._load_result:
+            self.notify("No manifests loaded", severity="error")
+            return
+
+        wf_data = self._load_result.get_workflow(workflow_id)
+        if not wf_data:
+            self.notify(f"Workflow data not found: {workflow_id}", severity="error")
+            return
+
+        try:
+            from claudechic.workflows.engine import WorkflowEngine, WorkflowManifest
+
+            # Construct manifest from LoadResult phases filtered by namespace
+            wf_phases = [
+                p for p in self._load_result.phases if p.namespace == workflow_id
+            ]
+            manifest = WorkflowManifest(
+                workflow_id=workflow_id,
+                phases=wf_phases,
+                main_role=wf_data.main_role,
+            )
+
+            # Prompt user to name/resume a chicsession so workflow state is
+            # persisted.  Must happen BEFORE creating the engine, because
+            # the engine's persist_fn checks self._chicsession_name and
+            # exits early if it is None.
+            if not self._chicsession_name:
+                session_name = await self._prompt_chicsession_name(workflow_id)
+                if session_name is None:
+                    # User cancelled the prompt — abort workflow activation
+                    self.notify(
+                        f"Workflow '{workflow_id}' activation cancelled",
+                        severity="warning",
+                    )
+                    return
+
+            self._workflow_engine = WorkflowEngine(
+                manifest=manifest,
+                persist_fn=self._make_persist_fn(),
+                confirm_callback=self._make_confirm_callback(),
+            )
+            phase = self._workflow_engine.get_current_phase()
+
+            # Build phase prompt content synchronously BEFORE sending,
+            # so the agent gets instructions immediately (not via async
+            # broadcast which arrives late — same fix as advance_phase).
+            phase_intro = ""
+            if wf_data.main_role:
+                try:
+                    from claudechic.workflows.agent_folders import (
+                        assemble_phase_prompt,
+                    )
+
+                    prompt = assemble_phase_prompt(
+                        workflows_dir=Path.cwd() / "workflows",
+                        workflow_id=workflow_id,
+                        role_name=wf_data.main_role,
+                        current_phase=phase,
+                    )
+                    if prompt:
+                        phase_intro = (
+                            f"[Workflow '{workflow_id}' activated — phase: "
+                            f"{phase or 'none'}]\n\n{prompt}\n\n"
+                            "Please greet the user, explain what phase "
+                            "they are in, and guide them on what to do next."
+                        )
+                except Exception:
+                    log.debug(
+                        "Failed to assemble phase prompt during activation",
+                        exc_info=True,
+                    )
+
+            self.notify(
+                f"Workflow '{workflow_id}' activated — phase: {phase or 'none'}"
+            )
+
+            # Send phase content synchronously to the active agent
+            if phase_intro:
+                self._send_to_active_agent(phase_intro)
+        except Exception as e:
+            log.warning("Failed to activate workflow '%s': %s", workflow_id, e)
+            self.notify(f"Failed to activate workflow: {e}", severity="error")
+
+    async def _prompt_chicsession_name(self, workflow_id: str) -> str | None:
+        """Prompt the user to name or resume a chicsession for workflow activation.
+
+        Shows a TUI prompt with:
+        - Existing chicsessions to resume (if any)
+        - A text input option to create a new session (default: workflow_id)
+
+        Returns the chosen session name, or None if the user cancelled.
+        Sets self._chicsession_name and creates/loads the session on disk.
+        """
+        from claudechic.chicsession_cmd import (
+            _get_manager,
+            _update_sidebar_label,
+        )
+        from claudechic.chicsessions import Chicsession, ChicsessionEntry
+        from claudechic.widgets.prompts import SelectionPrompt
+
+        mgr = _get_manager()
+        existing = mgr.list_chicsessions()
+
+        # Build prompt options: existing sessions first, then "New session"
+        options: list[tuple[str, str]] = []
+        for name in existing:
+            try:
+                cs = mgr.load(name)
+                agent_count = len(cs.agents)
+                agent_names = ", ".join(a.name for a in cs.agents[:4])
+                if len(cs.agents) > 4:
+                    agent_names += ", ..."
+                wf_label = ""
+                if cs.workflow_state and cs.workflow_state.get("workflow_id") == workflow_id:
+                    wf_label = " [matching workflow]"
+                options.append((
+                    f"resume:{name}",
+                    f"Resume '{name}' ({agent_count} agent{'s' if agent_count != 1 else ''}: {agent_names}){wf_label}",
+                ))
+            except (ValueError, FileNotFoundError):
+                options.append((
+                    f"resume:{name}",
+                    f"Resume '{name}' (corrupt/empty)",
+                ))
+
+        title = f"Name this session for workflow '{workflow_id}'"
+        text_option = ("new", f"New session (default: {workflow_id})")
+
+        prompt = SelectionPrompt(title, options, text_option=text_option)
+
+        try:
+            async with self._show_prompt(prompt):
+                result = await prompt.wait()
+        except Exception as e:
+            log.warning("Chicsession prompt failed: %s", e)
+            return None
+
+        if not result:
+            # User cancelled (pressed Escape)
+            return None
+
+        if result.startswith("resume:"):
+            # Resume existing session
+            session_name = result[len("resume:"):]
+            try:
+                mgr.load(session_name)  # Validate it loads
+                self._chicsession_name = session_name
+                _update_sidebar_label(self, session_name)
+                log.info(
+                    "Resumed existing chicsession '%s' for workflow activation",
+                    session_name,
+                )
+                return session_name
+            except (FileNotFoundError, ValueError) as exc:
+                log.warning("Failed to load chicsession '%s': %s", session_name, exc)
+                self.notify(
+                    f"Could not load session '{session_name}': {exc}",
+                    severity="error",
+                )
+                return None
+
+        # New session — extract name from text input or use default
+        if result.startswith("new:"):
+            session_name = result[len("new:"):].strip()
+        elif result == "new":
+            session_name = ""
+        else:
+            session_name = ""
+
+        if not session_name:
+            session_name = workflow_id
+
+        # Create fresh session
+        entries: list[ChicsessionEntry] = []
+        active_name = "main"
+        if self.agent_mgr:
+            for agent in self.agent_mgr.agents.values():
+                if agent.session_id:
+                    entries.append(
+                        ChicsessionEntry(
+                            name=agent.name,
+                            session_id=agent.session_id,
+                            cwd=str(agent.cwd),
+                        )
+                    )
+            active = self.agent_mgr.active
+            if active:
+                active_name = active.name
+            elif entries:
+                active_name = entries[0].name
+
+        cs = Chicsession(
+            name=session_name,
+            active_agent=active_name,
+            agents=entries,
+        )
+        try:
+            mgr.save(cs)
+            self._chicsession_name = session_name
+            _update_sidebar_label(self, session_name)
+            log.info(
+                "Created chicsession '%s' for workflow activation",
+                session_name,
+            )
+            return session_name
+        except Exception:
+            log.warning(
+                "Failed to create chicsession '%s'",
+                session_name,
+                exc_info=True,
+            )
+            return None
+
+    def _inject_phase_prompt_to_main_agent(
+        self,
+        workflow_id: str,
+        main_role: str,
+        current_phase: str | None,
+    ) -> None:
+        """Read phase markdown and broadcast to all agents.
+
+        Sends the phase prompt to every running agent so they all
+        stay in sync when the workflow activates or advances.
+        """
+        try:
+            from claudechic.workflows.agent_folders import assemble_phase_prompt
+
+            prompt = assemble_phase_prompt(
+                workflows_dir=Path.cwd() / "workflows",
+                workflow_id=workflow_id,
+                role_name=main_role,
+                current_phase=current_phase,
+            )
+            if prompt:
+                intro = (
+                    f"[Workflow '{workflow_id}' activated — phase: "
+                    f"{current_phase or 'none'}]\n\n{prompt}\n\n"
+                    "Please greet the user, explain what phase they are in, "
+                    "and guide them on what to do next."
+                )
+                # Broadcast to all agents, not just the active one
+                if self.agent_mgr:
+                    for agent in self.agent_mgr:
+                        self._send_to_agent(agent, intro)
+                else:
+                    self._send_to_active_agent(intro)
+            else:
+                log.debug(
+                    "No phase prompt found for main_role='%s' phase='%s'",
+                    main_role,
+                    current_phase,
+                )
+        except Exception:
+            log.debug("Failed to inject phase prompt to agents", exc_info=True)
+
+    def _deactivate_workflow(self) -> None:
+        """Deactivate current workflow. Destroys engine, clears state."""
+        if not self._workflow_engine:
+            self.notify("No active workflow", severity="warning")
+            return
+
+        wf_id = self._workflow_engine.workflow_id
+        self._workflow_engine = None
+
+        # Clear workflow_state from chicsession if present
+        if self._chicsession_name:
+            try:
+                from claudechic.chicsession_cmd import _get_manager
+
+                mgr = _get_manager()
+                cs = mgr.load(self._chicsession_name)
+                cs.workflow_state = None
+                mgr.save(cs)
+            except Exception:
+                log.debug("Failed to clear workflow state from chicsession", exc_info=True)
+
+            # Clear the session name so that activating a different workflow
+            # won't persist its state to the old workflow's session file.
+            from claudechic.chicsession_cmd import _update_sidebar_label
+
+            self._chicsession_name = None
+            _update_sidebar_label(self, None)
+
+        self.notify(f"Workflow '{wf_id}' deactivated")
+
+    def _make_persist_fn(self):
+        """Create callback for engine to persist workflow state via chicsession."""
+
+        async def persist(state: dict) -> None:
+            if not self._chicsession_name:
+                return
+            try:
+                from claudechic.chicsession_cmd import _get_manager
+
+                mgr = _get_manager()
+                cs = mgr.load(self._chicsession_name)
+                cs.workflow_state = state
+                mgr.save(cs)
+            except Exception:
+                log.debug("Failed to persist workflow state", exc_info=True)
+
+        return persist
+
+    def _make_confirm_callback(self):
+        """Create async confirm callback for ManualConfirm checks."""
+
+        async def confirm(message: str) -> bool:
+            return await self._show_override_prompt("advance-check", message)
+
+        return confirm
+
+    def _restore_workflow_from_session(self) -> None:
+        """Restore workflow engine from chicsession on session resume."""
+        if not self._chicsession_name:
+            return
+
+        try:
+            from claudechic.chicsession_cmd import _get_manager
+
+            mgr = _get_manager()
+            cs = mgr.load(self._chicsession_name)
+            if not cs.workflow_state:
+                return
+
+            wf_id = cs.workflow_state.get("workflow_id")
+            if not wf_id or wf_id not in self._workflow_registry:
+                return
+
+            if not self._load_result:
+                return
+
+            from claudechic.workflows.engine import WorkflowEngine, WorkflowManifest
+
+            # Construct manifest from LoadResult phases filtered by namespace
+            wf_phases = [
+                p for p in self._load_result.phases if p.namespace == wf_id
+            ]
+            manifest = WorkflowManifest(
+                workflow_id=wf_id,
+                phases=wf_phases,
+                main_role=wf_data.main_role,
+            )
+
+            self._workflow_engine = WorkflowEngine.from_session_state(
+                state=cs.workflow_state,
+                manifest=manifest,
+                persist_fn=self._make_persist_fn(),
+                confirm_callback=self._make_confirm_callback(),
+            )
+            phase = self._workflow_engine.get_current_phase()
+            self.notify(f"Restored workflow '{wf_id}' — phase: {phase or 'none'}")
+        except Exception:
+            log.debug("Failed to restore workflow from session", exc_info=True)
+
+    async def _handle_workflow_command(self, cmd: str, args: str) -> bool:
+        """Handle workflow-related slash commands. Returns True if handled."""
+        # /workflow list
+        if cmd == "/workflow" and args.strip() == "list":
+            lines = ["Discovered workflows:"]
+            for wf_id, wf_path in sorted(self._workflow_registry.items()):
+                status = "active" if (
+                    self._workflow_engine
+                    and self._workflow_engine.workflow_id == wf_id
+                ) else "available"
+                lines.append(f"  {wf_id} [{status}] — {wf_path}")
+            if not self._workflow_registry:
+                lines.append("  (none)")
+            self._show_system_info("\n".join(lines), "info", None)
+            return True
+
+        # /workflow reload
+        if cmd == "/workflow" and args.strip() == "reload":
+            self._discover_workflows()
+            self._show_system_info(
+                f"Reloaded manifests. {len(self._workflow_registry)} workflow(s) available.",
+                "info",
+                None,
+            )
+            return True
+
+        # /{workflow-id} stop
+        for wf_id in self._workflow_registry:
+            wf_cmd = f"/{wf_id}"
+            if cmd == wf_cmd:
+                if args.strip() == "stop":
+                    self._deactivate_workflow()
+                else:
+                    await self._activate_workflow(wf_id)
+                return True
+
+        return False
+
+    def _close_workflow_resources(self) -> None:
+        """Clean up workflow resources on app shutdown."""
+        if self._hit_logger:
+            self._hit_logger.close()
+            self._hit_logger = None
 
     _review_poll_timer: Timer | None = None
     _review_poll_agent_id: str | None = None  # agent that owns the poll timer
@@ -1688,6 +2318,11 @@ class ChatApp(App):
         If the agent is still idle and still owes a reply when the timer
         fires, a reminder message is sent automatically (up to REPLY_NUDGE_MAX
         times).
+
+        Uses a generation counter to prevent duplicate nudge timers from
+        accumulating across multiple on_complete calls.  Each scheduling
+        increments the generation; the timer callback is a no-op if its
+        captured generation doesn't match the current one.
         """
         caller = agent._pending_reply_to
         if not caller:
@@ -1705,6 +2340,9 @@ class ChatApp(App):
             agent._reply_nudge_count = 0
             return
 
+        # Bump generation so any previously scheduled timer becomes stale
+        agent._nudge_generation += 1
+        generation = agent._nudge_generation
         agent_id = agent.id  # capture for closure
 
         def _fire_nudge() -> None:
@@ -1712,6 +2350,9 @@ class ChatApp(App):
             if not self.agent_mgr or agent_id not in self.agent_mgr.agents:
                 return
             a = self.agent_mgr.agents[agent_id]
+            # Stale timer — a newer nudge was scheduled since this one
+            if a._nudge_generation != generation:
+                return
             # Only nudge if still idle and still owes a reply to the same caller
             if a._pending_reply_to != caller:
                 return
@@ -1751,6 +2392,9 @@ class ChatApp(App):
         Args:
             reason: Why the app is closing (quit, crash, error)
         """
+        # Close workflow resources (hit logger, etc.)
+        self._close_workflow_resources()
+
         # Close all agents in parallel (fires agent_closed events with message_count)
         if self.agent_mgr:
             await self.agent_mgr.close_all()

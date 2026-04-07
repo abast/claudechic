@@ -47,13 +47,17 @@ class Chicsession:
     name: str
     active_agent: str
     agents: list[ChicsessionEntry] = field(default_factory=list)
+    workflow_state: dict | None = None  # Opaque to session system, owned by engine
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name,
             "active_agent": self.active_agent,
             "agents": [a.to_dict() for a in self.agents],
         }
+        if self.workflow_state is not None:
+            d["workflow_state"] = self.workflow_state
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> Chicsession:
@@ -61,6 +65,7 @@ class Chicsession:
             name=data["name"],
             active_agent=data["active_agent"],
             agents=[ChicsessionEntry.from_dict(a) for a in data.get("agents", [])],
+            workflow_state=data.get("workflow_state"),
         )
 
 
