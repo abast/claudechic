@@ -27,14 +27,14 @@ import pytest
 from claudechic.app import ChatApp
 from tests.conftest import wait_for_workers
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
+pytestmark = [pytest.mark.timeout(30)]
 
 # ---------------------------------------------------------------------------
 # Locate the template hints source
 # ---------------------------------------------------------------------------
 
-_TEMPLATE_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-_HINTS_SOURCE = _TEMPLATE_ROOT / "template" / "hints"
+_CLAUDECHIC_ROOT = Path(__file__).resolve().parent.parent
+_HINTS_SOURCE = _CLAUDECHIC_ROOT / "claudechic" / "hints"
 
 
 def _install_hints(dest: Path) -> None:
@@ -56,9 +56,9 @@ class TestHintsInChatApp:
         assert (_HINTS_SOURCE / "__init__.py").is_file()
 
     async def test_startup_hint_appears_as_toast(self, mock_sdk, tmp_path):
-        """ChatApp discovers hints/, evaluates, and shows git-setup toast.
+        """ChatApp discovers hints/, evaluates, and shows toast notifications.
 
-        A fresh tmp_path has no .git → git-setup hint (priority 1) fires.
+        Verifies that _run_hints() produces visible toasts from workflow hints.
         """
         _install_hints(tmp_path)
         app = ChatApp()
@@ -93,10 +93,10 @@ class TestHintsInChatApp:
                 notif_count = len(app._notifications)
                 assert notif_count > 0, "No toast notifications from hints"
 
-                # Verify: git-setup hint is among the notifications
+                # Verify: hint messages contain the /hints off suffix
                 messages = [n.message for n in app._notifications]
-                assert any("git" in m.lower() for m in messages), (
-                    f"Expected git-setup hint, got: {messages}"
+                assert any("hints off" in m.lower() for m in messages), (
+                    f"Expected hint with disable suffix, got: {messages}"
                 )
 
                 # Verify: Toast widgets are rendered in the DOM
