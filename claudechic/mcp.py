@@ -695,13 +695,35 @@ async def advance_phase(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
     )
 
     if result.success:
-        # Inject new phase prompt to the active agent
+        # Build phase prompt content synchronously so the calling agent
+        # gets the new phase instructions in the tool response (not later
+        # via async broadcast, which caused BUG #1: late/out-of-order
+        # phase injections).
+        phase_content = ""
         main_role = getattr(engine.manifest, "main_role", None)
         if main_role:
+            try:
+                from claudechic.workflows.agent_folders import assemble_phase_prompt
+
+                phase_content = assemble_phase_prompt(
+                    workflows_dir=Path.cwd() / "workflows",
+                    workflow_id=engine.workflow_id,
+                    role_name=main_role,
+                    current_phase=next_phase,
+                ) or ""
+            except Exception:
+                log.debug("Failed to assemble phase prompt for advance_phase response", exc_info=True)
+
+            # Still broadcast to OTHER agents asynchronously so they get
+            # the phase update too (the caller already has it inline).
             _app._inject_phase_prompt_to_main_agent(
                 engine.workflow_id, main_role, next_phase
             )
-        return _text_response(f"Advanced to phase: {next_phase}")
+
+        response = f"Advanced to phase: {next_phase}"
+        if phase_content:
+            response += f"\n\n--- Phase Instructions ---\n\n{phase_content}"
+        return _text_response(response)
     else:
         return _error_response(f"Advance blocked: {result.reason}")
 
