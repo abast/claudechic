@@ -1250,15 +1250,43 @@ class ChatApp(App):
                 confirm_callback=self._make_confirm_callback(),
             )
             phase = self._workflow_engine.get_current_phase()
+
+            # Build phase prompt content synchronously BEFORE sending,
+            # so the agent gets instructions immediately (not via async
+            # broadcast which arrives late — same fix as advance_phase).
+            phase_intro = ""
+            if wf_data.main_role:
+                try:
+                    from claudechic.workflows.agent_folders import (
+                        assemble_phase_prompt,
+                    )
+
+                    prompt = assemble_phase_prompt(
+                        workflows_dir=Path.cwd() / "workflows",
+                        workflow_id=workflow_id,
+                        role_name=wf_data.main_role,
+                        current_phase=phase,
+                    )
+                    if prompt:
+                        phase_intro = (
+                            f"[Workflow '{workflow_id}' activated — phase: "
+                            f"{phase or 'none'}]\n\n{prompt}\n\n"
+                            "Please greet the user, explain what phase "
+                            "they are in, and guide them on what to do next."
+                        )
+                except Exception:
+                    log.debug(
+                        "Failed to assemble phase prompt during activation",
+                        exc_info=True,
+                    )
+
             self.notify(
                 f"Workflow '{workflow_id}' activated — phase: {phase or 'none'}"
             )
 
-            # Send phase content to main agent so it can guide the user
-            if wf_data.main_role:
-                self._inject_phase_prompt_to_main_agent(
-                    workflow_id, wf_data.main_role, phase
-                )
+            # Send phase content synchronously to the active agent
+            if phase_intro:
+                self._send_to_active_agent(phase_intro)
         except Exception as e:
             log.warning("Failed to activate workflow '%s': %s", workflow_id, e)
             self.notify(f"Failed to activate workflow: {e}", severity="error")
@@ -1517,7 +1545,11 @@ class ChatApp(App):
             wf_phases = [
                 p for p in self._load_result.phases if p.namespace == wf_id
             ]
-            manifest = WorkflowManifest(workflow_id=wf_id, phases=wf_phases)
+            manifest = WorkflowManifest(
+                workflow_id=wf_id,
+                phases=wf_phases,
+                main_role=wf_data.main_role,
+            )
 
             self._workflow_engine = WorkflowEngine.from_session_state(
                 state=cs.workflow_state,
