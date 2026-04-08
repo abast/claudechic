@@ -1524,7 +1524,7 @@ class ChatApp(App):
             _update_sidebar_label(self, None)
 
         # Remove phase context file
-        phase_file = Path.cwd() / ".claude" / "phase_context.md"
+        phase_file = self._cwd / ".claude" / "phase_context.md"
         if phase_file.is_file():
             try:
                 phase_file.unlink()

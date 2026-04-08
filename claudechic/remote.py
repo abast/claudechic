@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 from pathlib import Path
 
 from rich.console import Console
@@ -76,7 +77,7 @@ async def handle_screenshot(request: web.Request) -> web.Response:
             actual_png = f"{result_path}.png"
             if Path(actual_png).exists():
                 # Rename to requested path
-                Path(actual_png).rename(png_path)
+                os.replace(actual_png, str(png_path))
                 result_path = png_path
 
         return web.json_response({"path": result_path, "format": fmt})

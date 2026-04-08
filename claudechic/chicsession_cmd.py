@@ -151,13 +151,25 @@ def _handle_save(app: ChatApp, name: str) -> None:
         except Exception:
             log.debug("Failed to capture workflow state during save", exc_info=True)
 
+    # If engine is None but a saved chicsession exists, preserve its
+    # workflow_state instead of overwriting with None.  This handles the
+    # restore-then-save scenario where the engine hasn't been reconstructed
+    # yet but the persisted state should survive.
+    mgr = _get_manager(app)
+    if workflow_state is None:
+        try:
+            existing = mgr.load(name)
+            if existing and existing.workflow_state:
+                workflow_state = existing.workflow_state
+        except Exception:
+            pass  # File doesn't exist yet — nothing to preserve
+
     cs = Chicsession(
         name=name,
         active_agent=active_name,
         agents=entries,
         workflow_state=workflow_state,
     )
-    mgr = _get_manager(app)
     mgr.save(cs)
 
     # Activate auto-save: future agent create/close will update this file
@@ -302,6 +314,19 @@ def auto_save_chicsession(app: ChatApp) -> None:
         except Exception:
             log.debug("Failed to capture workflow state during auto-save", exc_info=True)
 
+    # If engine is None but a saved chicsession exists, preserve its
+    # workflow_state instead of overwriting with None.  This handles the
+    # restore-then-save scenario where the engine hasn't been reconstructed
+    # yet but the persisted state should survive.
+    mgr = _get_manager(app)
+    if workflow_state is None:
+        try:
+            existing = mgr.load(name)
+            if existing and existing.workflow_state:
+                workflow_state = existing.workflow_state
+        except Exception:
+            pass  # File doesn't exist yet — nothing to preserve
+
     cs = Chicsession(
         name=name,
         active_agent=active_name,
@@ -309,7 +334,7 @@ def auto_save_chicsession(app: ChatApp) -> None:
         workflow_state=workflow_state,
     )
     try:
-        _get_manager(app).save(cs)
+        mgr.save(cs)
         log.debug("Auto-saved chicsession '%s' (%d agents)", name, len(entries))
     except Exception as exc:
         log.warning("Failed to auto-save chicsession '%s': %s", name, exc)

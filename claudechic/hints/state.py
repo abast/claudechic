@@ -13,6 +13,7 @@ LEAF MODULE: stdlib only. No imports from workflows/, checks/, or guardrails/.
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import time
@@ -358,7 +359,7 @@ class HintStateStore:
                 with open(fd, "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2)
                     f.write("\n")
-                Path(tmp_name).rename(self._path)
+                os.replace(tmp_name, str(self._path))
             except BaseException:
                 try:
                     Path(tmp_name).unlink(missing_ok=True)
