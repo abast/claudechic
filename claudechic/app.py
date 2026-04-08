@@ -3501,6 +3501,13 @@ class ChatApp(App):
         try:
             await self._reconnect_agent(agent, agent.session_id)
             self.notify("Reconnected", timeout=2)
+            # Drain any messages that were queued while disconnected
+            if agent._pending_messages:
+                log.info(
+                    "Draining %d queued message(s) after reconnect",
+                    len(agent._pending_messages),
+                )
+                agent._drain_next_message()
         except Exception as e:
             log.exception("Failed to reconnect after interrupt")
             await capture(

@@ -631,6 +631,23 @@ class Agent:
         await asyncio.sleep(0.1)  # Let UI update
         await self.send(message)
 
+    def _is_transport_alive(self) -> bool:
+        """Check if the Claude Code subprocess is still running."""
+        try:
+            client = self.client
+            if not client:
+                return False
+            query = getattr(client, "_query", None)
+            if not query:
+                return False
+            transport = getattr(query, "transport", None)
+            if not transport:
+                return False
+            process = getattr(transport, "_process", None)
+            return bool(process and process.pid and process.returncode is None)
+        except Exception:
+            return False
+
     def _drain_next_message(self) -> None:
         """Pop the first queued message and start processing it.
 
@@ -640,6 +657,21 @@ class Agent:
         """
         if not self._pending_messages:
             return
+
+        # If the CLI process has exited, trigger reconnection instead of
+        # trying to write to a dead process.  Messages stay queued and will
+        # be drained after reconnection completes.
+        if not self._is_transport_alive():
+            log.warning(
+                "Agent '%s': transport dead, triggering reconnect "
+                "(%d message(s) still queued)",
+                self.name,
+                len(self._pending_messages),
+            )
+            if self.observer:
+                self.observer.on_connection_lost(self)
+            return
+
         prompt, display_as = self._pending_messages.pop(0)
         log.info(
             "Agent '%s' draining queued message (%d remaining)",
