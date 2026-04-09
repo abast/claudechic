@@ -1579,6 +1579,11 @@ class ChatApp(App):
             if not self._load_result:
                 return
 
+            # Fetch workflow data from load_result to get main_role
+            wf_data = self._load_result.get_workflow(wf_id)
+            if not wf_data:
+                return
+
             from claudechic.workflows.engine import WorkflowEngine, WorkflowManifest
 
             # Construct manifest from LoadResult phases filtered by namespace
