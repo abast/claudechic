@@ -198,6 +198,8 @@ class ChatApp(App):
         self._input_container: Vertical | None = None
         self._chat_input: ChatInput | None = None
         self._status_footer: StatusFooter | None = None
+        # Signal: SDK connected (used by onboarding to wait before mounting)
+        self._sdk_connected: asyncio.Event = asyncio.Event()
         # Track running shell command for Ctrl+C cancellation
         self._shell_process: asyncio.subprocess.Process | None = None
         # Pending shell cancel handlers (widget_id -> callback)
@@ -890,6 +892,10 @@ class ChatApp(App):
         import asyncio
 
         try:
+            # Wait for SDK connection before mounting welcome screen,
+            # otherwise selecting a workflow would fail with CLIConnectionError
+            await asyncio.wait_for(self._sdk_connected.wait(), timeout=30)
+
             from claudechic.onboarding import check_onboarding
 
             # Health checks (SSH etc.) run in a thread to avoid blocking UI
@@ -993,6 +999,9 @@ class ChatApp(App):
 
             # Restore workflow state from chicsession if present
             self._restore_workflow_from_session()
+
+        # Signal that SDK is connected (unblocks onboarding welcome screen)
+        self._sdk_connected.set()
 
         # Fetch SDK commands and update autocomplete
         await self._update_slash_commands()
