@@ -87,20 +87,10 @@ def _cluster_configured(project_root: Path) -> bool:
 
     backend = data.get("backend", "")
     ssh_target = data.get("ssh_target", "")
-    if not backend or not ssh_target:
-        return False
-
-    # Verify SSH connectivity (5s timeout)
-    try:
-        result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-             ssh_target, "echo", "ok"],
-            capture_output=True,
-            timeout=10,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+    # Config is considered complete if backend and ssh_target are set.
+    # We don't test SSH liveness here — it's slow, can fail transiently,
+    # and doesn't work reliably on all platforms (e.g. Windows).
+    return bool(backend) and bool(ssh_target)
 
 
 def _git_configured(project_root: Path) -> bool:
