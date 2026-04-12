@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -408,6 +409,7 @@ class TestIsUserCommand:
         # _is_user_command checks cwd/.claude/skills/... so pass tmp_path as cwd
         assert _is_user_command("/roborev:fix", tmp_path) is True
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows does not allow ':' in directory names")
     def test_colon_skill_dir(self, tmp_path):
         """Colon command also matches colon-named directory if it exists."""
         skill_dir = tmp_path / ".claude" / "skills" / "roborev:fix"

@@ -1,5 +1,6 @@
 """App-level UI tests without SDK dependency."""
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -593,6 +594,7 @@ async def test_sdk_stderr_ignores_empty(mock_sdk):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="Bang command async workers not supported on Windows")
 async def test_bang_command_inline_shell(mock_sdk):
     """'!cmd' runs shell command and displays output inline."""
     from claudechic.widgets import ShellOutputWidget
@@ -616,6 +618,7 @@ async def test_bang_command_inline_shell(mock_sdk):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="Bang command async workers not supported on Windows")
 async def test_bang_command_captures_stderr(mock_sdk):
     """'!cmd' captures stderr output (merged with stdout via PTY)."""
     from claudechic.widgets import ShellOutputWidget
@@ -638,6 +641,7 @@ async def test_bang_command_captures_stderr(mock_sdk):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="Bang command async workers not supported on Windows")
 async def test_bang_command_shows_exit_code(mock_sdk):
     """'!cmd' shows non-zero exit code in title."""
     from claudechic.widgets import ShellOutputWidget
