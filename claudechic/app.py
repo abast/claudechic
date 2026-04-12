@@ -2578,8 +2578,12 @@ class ChatApp(App):
     def run_shell_command(
         self, cmd: str, shell: str, cwd: str | None, env: dict[str, str]
     ) -> None:
-        """Run a shell command async with PTY for color support."""
-        from claudechic.shell_runner import run_in_pty_cancellable
+        """Run a shell command async with PTY (Unix) or pipes (Windows)."""
+        from claudechic.shell_runner import (
+            UNIX_PTY_SUPPORT,
+            run_in_pty_cancellable,
+            run_in_subprocess_cancellable,
+        )
         from claudechic.widgets import PendingShellWidget, ShellOutputWidget
 
         chat_view = self._chat_view
@@ -2609,7 +2613,8 @@ class ChatApp(App):
 
                 tip_task = create_safe_task(show_tip_after_delay(), name="tip-delay")
 
-                output, returncode, was_cancelled = await run_in_pty_cancellable(
+                run_fn = run_in_pty_cancellable if UNIX_PTY_SUPPORT else run_in_subprocess_cancellable
+                output, returncode, was_cancelled = await run_fn(
                     cmd, shell, cwd, env, cancel_event
                 )
                 tip_task.cancel()

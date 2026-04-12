@@ -577,14 +577,7 @@ def _handle_shell(app: "ChatApp", command: str) -> bool:
             if two_words in INTERACTIVE_SUBCOMMANDS:
                 interactive = True
 
-    # Windows doesn't have PTY support for captured output - force interactive mode
     is_windows = sys.platform == "win32"
-    if is_windows and cmd and not interactive:
-        app.notify(
-            "Captured shell output not supported on Windows. Running interactively.",
-            severity="warning",
-        )
-        interactive = True
 
     agent = app._agent
     cwd = str(agent.cwd) if agent else None

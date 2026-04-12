@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -409,14 +408,24 @@ class TestIsUserCommand:
         # _is_user_command checks cwd/.claude/skills/... so pass tmp_path as cwd
         assert _is_user_command("/roborev:fix", tmp_path) is True
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="Windows does not allow ':' in directory names")
     def test_colon_skill_dir(self, tmp_path):
-        """Colon command also matches colon-named directory if it exists."""
-        skill_dir = tmp_path / ".claude" / "skills" / "roborev:fix"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text("# skill")
+        """Colon command also matches colon-named directory if it exists.
 
-        assert _is_user_command("/roborev:fix", tmp_path) is True
+        We mock path existence rather than creating a real directory because
+        Windows does not allow ':' in directory names.
+        """
+        colon_skill = tmp_path / ".claude" / "skills" / "roborev:fix" / "SKILL.md"
+
+        # Make _is_user_command find the colon-named path without touching the filesystem
+        original_exists = type(colon_skill).exists
+
+        def mock_exists(self_path: "MagicMock | object") -> bool:
+            if str(self_path) == str(colon_skill):
+                return True
+            return original_exists(self_path)  # type: ignore[arg-type]
+
+        with patch.object(type(colon_skill), "exists", mock_exists):
+            assert _is_user_command("/roborev:fix", tmp_path) is True
 
     def test_no_skill_dir(self, tmp_path):
         """Returns False when no matching skill directory exists."""
