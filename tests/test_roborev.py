@@ -409,23 +409,26 @@ class TestIsUserCommand:
         assert _is_user_command("/roborev:fix", tmp_path) is True
 
     def test_colon_skill_dir(self, tmp_path):
-        """Colon command also matches colon-named directory if it exists.
+        """Colon command matches directory on disk.
 
-        We mock path existence rather than creating a real directory because
-        Windows does not allow ':' in directory names.
+        On Unix, colon-named directories are valid so we test the literal name.
+        On Windows, ':' is invalid in paths so we test the hyphenated fallback,
+        which is the real behavior users get on Windows.
         """
-        colon_skill = tmp_path / ".claude" / "skills" / "roborev:fix" / "SKILL.md"
+        import sys
 
-        # Make _is_user_command find the colon-named path without touching the filesystem
-        original_exists = type(colon_skill).exists
+        if sys.platform == "win32":
+            # Windows: colons invalid in paths, so the hyphen fallback is what matters
+            dir_name = "roborev-fix"
+        else:
+            # Unix: colon-named directories are valid
+            dir_name = "roborev:fix"
 
-        def mock_exists(self_path: "MagicMock | object") -> bool:
-            if str(self_path) == str(colon_skill):
-                return True
-            return original_exists(self_path)  # type: ignore[arg-type]
+        skill_dir = tmp_path / ".claude" / "skills" / dir_name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# skill")
 
-        with patch.object(type(colon_skill), "exists", mock_exists):
-            assert _is_user_command("/roborev:fix", tmp_path) is True
+        assert _is_user_command("/roborev:fix", tmp_path) is True
 
     def test_no_skill_dir(self, tmp_path):
         """Returns False when no matching skill directory exists."""
