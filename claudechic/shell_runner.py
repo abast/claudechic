@@ -206,3 +206,104 @@ async def run_in_pty_cancellable(
         env,
         cancel_event.is_set,
     )
+
+
+def _run_in_subprocess_with_cancel(
+    cmd: str,
+    shell: str,
+    cwd: str | None,
+    env: dict[str, str],
+    check_cancelled: Callable[[], bool],
+) -> tuple[str, int, bool]:
+    """Run command via subprocess pipes with cancellation support.
+
+    Fallback for Windows where PTY is not available. Merges stderr into stdout.
+
+    Args:
+        cmd: Command to run
+        shell: Shell to use (e.g. cmd.exe)
+        cwd: Working directory
+        env: Environment variables
+        check_cancelled: Callable that returns True if cancelled
+
+    Returns:
+        (output, returncode, was_cancelled) tuple
+    """
+    # Build args: on Windows use /c, on Unix use -c
+    if sys.platform == "win32":
+        args = [shell, "/c", cmd]
+    else:
+        args = [shell, "-c", cmd]
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=cwd,
+        env=env,
+    )
+
+    output = b""
+    was_cancelled = False
+    try:
+        while True:
+            if check_cancelled():
+                was_cancelled = True
+                proc.terminate()
+                break
+            # Read in small chunks with a timeout via poll
+            if proc.stdout is not None:
+                data = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else b""
+                if data:
+                    output += data
+                elif proc.poll() is not None:
+                    break
+                else:
+                    # No data yet and process still running — brief sleep to avoid busy loop
+                    import time
+
+                    time.sleep(0.05)
+            elif proc.poll() is not None:
+                break
+    finally:
+        # Drain any remaining output
+        if proc.stdout is not None:
+            remaining = proc.stdout.read()
+            if remaining:
+                output += remaining
+        proc.wait()
+
+    return output.decode(errors="replace"), proc.returncode or 0, was_cancelled
+
+
+async def run_in_subprocess_cancellable(
+    cmd: str,
+    shell: str,
+    cwd: str | None,
+    env: dict[str, str],
+    cancel_event: asyncio.Event,
+) -> tuple[str, int, bool]:
+    """Run command via subprocess pipes with async cancellation support.
+
+    Fallback for Windows where PTY is not available.
+
+    Args:
+        cmd: Command to run
+        shell: Shell to use
+        cwd: Working directory
+        env: Environment variables
+        cancel_event: Event that signals cancellation when set
+
+    Returns:
+        (output, returncode, was_cancelled) tuple
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        _run_in_subprocess_with_cancel,
+        cmd,
+        shell,
+        cwd,
+        env,
+        cancel_event.is_set,
+    )

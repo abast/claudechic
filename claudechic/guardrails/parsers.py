@@ -88,8 +88,8 @@ class RulesParser:
 
         qualified_id = f"{namespace}:{raw_id}"
 
-        raw_trigger = entry.get("trigger", "")
-        triggers = [raw_trigger] if isinstance(raw_trigger, str) else [str(t) for t in raw_trigger]
+        raw_trigger = entry.get("trigger") or ""
+        triggers = [raw_trigger] if isinstance(raw_trigger, str) else [str(t) for t in raw_trigger] if isinstance(raw_trigger, list) else []
         if not any(triggers):
             return f"rule '{raw_id}' has no trigger"
 
@@ -172,8 +172,8 @@ class InjectionsParser:
 
         qualified_id = f"{namespace}:{raw_id}"
 
-        raw_trigger = entry.get("trigger", "")
-        triggers = [raw_trigger] if isinstance(raw_trigger, str) else [str(t) for t in raw_trigger]
+        raw_trigger = entry.get("trigger") or ""
+        triggers = [raw_trigger] if isinstance(raw_trigger, str) else [str(t) for t in raw_trigger] if isinstance(raw_trigger, list) else []
         if not any(triggers):
             return f"injection '{raw_id}' has no trigger"
 

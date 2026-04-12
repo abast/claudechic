@@ -409,8 +409,22 @@ class TestIsUserCommand:
         assert _is_user_command("/roborev:fix", tmp_path) is True
 
     def test_colon_skill_dir(self, tmp_path):
-        """Colon command also matches colon-named directory if it exists."""
-        skill_dir = tmp_path / ".claude" / "skills" / "roborev:fix"
+        """Colon command matches directory on disk.
+
+        On Unix, colon-named directories are valid so we test the literal name.
+        On Windows, ':' is invalid in paths so we test the hyphenated fallback,
+        which is the real behavior users get on Windows.
+        """
+        import sys
+
+        if sys.platform == "win32":
+            # Windows: colons invalid in paths, so the hyphen fallback is what matters
+            dir_name = "roborev-fix"
+        else:
+            # Unix: colon-named directories are valid
+            dir_name = "roborev:fix"
+
+        skill_dir = tmp_path / ".claude" / "skills" / dir_name
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text("# skill")
 
