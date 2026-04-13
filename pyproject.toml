@@ -67,5 +67,8 @@ exclude = ["build", ".venv", "dist", "site", "**/__pycache__"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: integration tests (may be slower, uses more complex mocking)",
+]
 
 [tool.setuptools_scm]

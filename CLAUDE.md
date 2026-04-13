@@ -229,6 +229,19 @@ async for message in client.receive_response():
 
 Agent status indicators: ○ (idle), ● gray (busy), ● orange (needs input)
 
+### Inter-Agent Communication (MCP Tools)
+
+These tools let agents communicate programmatically:
+
+- **`ask_agent`** -- Send a question and expect a reply. The target agent is nudged if it goes idle without responding. Use when you need information back.
+- **`tell_agent`** -- Fire-and-forget message, no reply expected. If the target is busy, the message queues until its current task completes. Use for status updates, results, or answering questions.
+- **`interrupt_agent`** -- Interrupt an agent's current task immediately. Optionally redirect with a new prompt. Use when you need to stop or redirect a busy agent in real-time.
+
+**When to use which:**
+- Need a response? Use `ask_agent`.
+- Sending info, OK to wait? Use `tell_agent` (queues behind current work).
+- Need to stop/redirect NOW? Use `interrupt_agent` (cuts through immediately).
+
 ### Session Management
 - `/resume` - Show session picker
 - `/resume <id>` - Resume specific session

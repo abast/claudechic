@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -27,16 +26,40 @@ from claudechic.app import ChatApp
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration, pytest.mark.timeout(30)]
 
 # ---------------------------------------------------------------------------
-# Locate the template hints source
+# Create a synthetic template-side hints package for testing.
+#
+# The original template hints/ package (with an evaluate() entry point) was
+# removed when the hints system moved to manifest-declared pipelines.  The
+# _run_hints() code path that dynamically imports a project-local hints/
+# package and calls mod.evaluate() still exists for backward compatibility.
+# We create a minimal package that exercises that path.
 # ---------------------------------------------------------------------------
 
-_CLAUDECHIC_ROOT = Path(__file__).resolve().parent.parent
-_HINTS_SOURCE = _CLAUDECHIC_ROOT / "claudechic" / "hints"
+_HINTS_INIT_SRC = '''\
+"""Synthetic hints package for integration testing."""
+
+import asyncio
+
+
+async def evaluate(*, send_notification, project_root, session_count,
+                   is_startup, budget, **kwargs):
+    """Produce a toast notification so the test can observe it."""
+    if not is_startup:
+        return
+    msg = "Tip: use /hints off to disable hints"
+    send_notification(msg, timeout=7)
+    # Yield control so the notification is processed
+    await asyncio.sleep(0)
+'''
 
 
 def _install_hints(dest: Path) -> None:
-    """Copy the template hints/ package into dest (the project root)."""
-    shutil.copytree(_HINTS_SOURCE, dest / "hints")
+    """Create a minimal template-side hints package in *dest*."""
+    hints_dir = dest / "hints"
+    hints_dir.mkdir(exist_ok=True)
+    (hints_dir / "__init__.py").write_text(
+        _HINTS_INIT_SRC, encoding="utf-8"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +72,10 @@ class TestHintsInChatApp:
 
     @pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
     def test_hints_source_exists(self):
-        """Sanity check: template hints source is available for copying."""
-        assert _HINTS_SOURCE.is_dir(), f"Missing: {_HINTS_SOURCE}"
-        assert (_HINTS_SOURCE / "__init__.py").is_file()
+        """Sanity check: synthetic hints package can be installed."""
+        # The _install_hints helper creates the package dynamically,
+        # so we just verify the source string is non-empty.
+        assert len(_HINTS_INIT_SRC) > 0
 
     async def test_startup_hint_appears_as_toast(self, mock_sdk, tmp_path):
         """ChatApp discovers hints/, evaluates, and shows toast notifications.

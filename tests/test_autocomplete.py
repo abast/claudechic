@@ -34,8 +34,8 @@ async def test_slash_command_autocomplete(mock_sdk, tmp_path: Path):
         assert autocomplete.option_list.option_count >= 3
 
         # Type even more to narrow to just one
-        # Note: "/worktree f" fuzzy matches "/worktree side-files" too
-        input_widget.text = "/worktree fin"
+        # Note: "/worktree f" fuzzy matches branch names like "fix/..."
+        input_widget.text = "/worktree finis"
         await pilot.pause()
 
         # Should show just /worktree finish
@@ -90,8 +90,8 @@ async def test_tab_completion(mock_sdk):
         autocomplete = app.query_one(TextAreaAutoComplete)
 
         # Type enough to filter to a unique match
-        # Note: "/worktree f" fuzzy matches "/worktree side-files" too
-        input_widget.text = "/worktree fin"
+        # Note: "/worktree f" fuzzy matches branch names like "fix/..."
+        input_widget.text = "/worktree finis"
         await pilot.pause()
 
         # Should show just /worktree finish

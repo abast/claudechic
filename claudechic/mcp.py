@@ -5,6 +5,7 @@ Exposes tools for Claude to manage agents within claudechic:
 - spawn_worktree: Create git worktree + agent
 - ask_agent: Send question to existing agent (expects reply)
 - tell_agent: Send message to existing agent (no reply expected)
+- interrupt_agent: Interrupt an agent, optionally redirect with new prompt
 - list_agents: List current agents and their status
 - close_agent: Close an agent by name
 - finish_worktree: Finish current agent's worktree (commit, rebase, merge, cleanup)
@@ -642,6 +643,102 @@ def _make_close_agent(caller_name: str | None = None):
     return close_agent
 
 
+def _make_interrupt_agent(caller_name: str | None = None):
+    """Create interrupt_agent tool with caller name bound."""
+
+    @tool(
+        "interrupt_agent",
+        "Interrupt another agent's current task and optionally redirect it "
+        "with a new prompt. Awaits the interrupt to completion before sending "
+        "any redirect.",
+        {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the agent to interrupt",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "New prompt to send after interrupting (optional)",
+                },
+            },
+            "required": ["name"],
+        },
+    )
+    async def interrupt_agent(args: dict[str, Any]) -> dict[str, Any]:
+        """Interrupt an agent, optionally redirecting with a new prompt."""
+        try:
+            if _app is None or _app.agent_mgr is None:
+                return _error_response("App not initialized")
+            _track_mcp_tool("interrupt_agent")
+
+            name = args["name"]
+            prompt = args.get("prompt")
+
+            # Self-interrupt prevention
+            if caller_name and name == caller_name:
+                return _error_response("An agent cannot interrupt itself")
+
+            agent, error = _find_agent_by_name(name)
+            if agent is None:
+                return _error_response(error or "Agent not found")
+
+            # Idle agent: skip interrupt, optionally send prompt
+            if agent.status != "busy":
+                if prompt:
+                    _send_prompt_fire_and_forget(
+                        agent, prompt, caller_name=caller_name
+                    )
+                    return _text_response(
+                        f"Agent '{name}' was idle; sent new prompt"
+                    )
+                return _text_response(
+                    f"Agent '{name}' is not currently busy"
+                )
+
+            # Busy agent: await interrupt to completion
+            try:
+                await agent.interrupt()
+            except Exception as exc:
+                log.exception(f"interrupt_agent: interrupt failed for '{name}'")
+                return _error_response(
+                    f"Failed to interrupt '{name}': {exc}"
+                )
+
+            # Redirect with new prompt if provided
+            if prompt:
+                try:
+                    wrapped = prompt
+                    if caller_name:
+                        wrapped = (
+                            f"[Redirected by agent '{caller_name}']\n\n"
+                            f"{prompt}"
+                        )
+                    await agent.send(wrapped)
+                except Exception as exc:
+                    log.exception(
+                        f"interrupt_agent: redirect failed for '{name}'"
+                    )
+                    return _error_response(
+                        f"Interrupted '{name}' but failed to send "
+                        f"new prompt: {exc}"
+                    )
+                return _text_response(
+                    f"Interrupted '{name}' and sent new prompt"
+                )
+
+            return _text_response(f"Interrupted '{name}'")
+
+        except Exception as exc:
+            log.exception(f"interrupt_agent failed for '{args.get('name', 'unknown')}'")
+            return _error_response(
+                f"Failed to interrupt '{args.get('name', 'unknown')}': {exc}"
+            )
+
+    return interrupt_agent
+
+
 def discover_mcp_tools(mcp_tools_dir: Path, **kwargs) -> list:
     """Walk mcp_tools/, import each eligible .py, call get_tools()."""
     tools = []
@@ -939,6 +1036,7 @@ def create_chic_server(caller_name: str | None = None):
         _make_whoami(caller_name),
         list_agents,
         _make_close_agent(caller_name),
+        _make_interrupt_agent(caller_name),
         # Workflow guidance tools
         advance_phase,
         get_phase,
