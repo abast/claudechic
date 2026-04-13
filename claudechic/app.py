@@ -164,6 +164,9 @@ class ChatApp(App):
     # Auto-approve Edit/Write tools (but still prompt for Bash, etc.)
     AUTO_EDIT_TOOLS = {ToolName.EDIT, ToolName.WRITE}
 
+    # Toast debounce: suppress repeat toasts for the same key within this window
+    TOAST_COOLDOWN_SECONDS: float = 10.0
+
     # Width thresholds for layout (sidebar=28, min chat=80)
     SIDEBAR_MIN_WIDTH = 110  # Below this, hide sidebar
     CENTERED_SIDEBAR_WIDTH = 140  # Above this, center chat while showing sidebar
@@ -235,6 +238,9 @@ class ChatApp(App):
         self._load_result: Any = None  # LoadResult
         self._workflow_registry: dict[str, Path] = {}  # workflow_id -> directory
         self._workflow_engine: Any = None  # WorkflowEngine
+
+        # Toast debounce state: toast_key -> last-shown monotonic timestamp
+        self._toast_timestamps: dict[str, float] = {}
 
     def _fatal_error(self) -> None:
         """Override to use plain Python tracebacks instead of rich's fancy ones."""
@@ -663,30 +669,174 @@ class ChatApp(App):
             consume_override=self._token_store.consume,
         )
 
-    async def _show_override_prompt(self, rule_id: str, description: str) -> bool:
-        """Show override approval prompt for deny-level rules.
+    def _should_show_toast(self, toast_key: str | None) -> bool:
+        """Check whether a toast should be shown, enforcing per-key cooldown.
 
-        Used by the request_override MCP tool. User sees the exact
-        command details and approves/denies the specific action.
-        Returns True if user allows.
+        Returns True if:
+        - toast_key is None (no debounce requested), OR
+        - No toast with this key was shown within TOAST_COOLDOWN_SECONDS.
+
+        When returning True, records the current timestamp for the key.
+        """
+        if toast_key is None:
+            return True
+        now = time.monotonic()
+        last_shown = self._toast_timestamps.get(toast_key, 0.0)
+        if now - last_shown < self.TOAST_COOLDOWN_SECONDS:
+            return False
+        self._toast_timestamps[toast_key] = now
+        return True
+
+    async def _show_agent_prompt(
+        self,
+        title: str,
+        options: list[tuple[str, str]],
+        subtitle: str | None = None,
+        agent: Agent | None = None,
+        toast_message: str | None = None,
+        toast_key: str | None = None,
+        post_deny_message: str | None = None,
+    ) -> str | None:
+        """Show an approval prompt with agent awareness.
+
+        This is the shared UX law for all "agent needs user approval"
+        interactions. Handles: mount SelectionPrompt, set NEEDS_INPUT on
+        the requesting agent, toast if non-active, restore status after.
+
+        Callers provide domain-specific parameters (title, options, etc.)
+        without duplicating the agent-awareness logic.
+
+        Args:
+            title: Prompt title (ASCII only, no emoji).
+            options: List of (value, label) tuples for SelectionPrompt.
+            subtitle: Optional detail text below the title.
+            agent: The agent requesting approval. If None, uses active agent.
+            toast_message: Notification shown when agent is not active tab.
+                If None, no toast is shown.
+            toast_key: Deduplication key for toast_message. If a toast with
+                the same key was shown within TOAST_COOLDOWN_SECONDS, the
+                toast is suppressed (the prompt still shows). Typically
+                "{agent_id}:{domain_id}" (e.g., "agent-1:no_pip_install").
+                If None, toast is always shown (no debounce).
+            post_deny_message: Toast shown after user selects a deny-equivalent
+                option (any option whose value is not "allow"). If None, no
+                post-deny toast.
+
+        Returns:
+            The selected option value (str), or None if cancelled.
         """
         from claudechic.widgets.prompts import SelectionPrompt
 
-        try:
-            options = [
-                ("allow", "Allow — approve this specific action"),
-                ("deny", "Deny — block this action"),
-            ]
-            title = f"\U0001f6e1\ufe0f Override request: {rule_id}"
-            prompt = SelectionPrompt(title, options)
+        target_agent = agent or self._agent
+        previous_status = None
 
-            async with self._show_prompt(prompt):
+        # Set NEEDS_INPUT on the requesting agent
+        if target_agent:
+            previous_status = target_agent.status
+            target_agent._set_status(AgentStatus.NEEDS_INPUT)
+
+            # Toast if this agent is not the active tab (with debounce)
+            if (
+                toast_message
+                and target_agent.id != self.active_agent_id
+                and self._should_show_toast(toast_key)
+            ):
+                self.notify(toast_message, severity="information")
+
+        try:
+            prompt = SelectionPrompt(title, options, subtitle=subtitle)
+            async with self._show_prompt(prompt, agent=target_agent):
                 result = await prompt.wait()
 
-            return result == "allow"
+            # Post-deny feedback
+            if result != "allow" and post_deny_message:
+                self.notify(post_deny_message, severity="warning")
+
+            return result
         except Exception as e:
-            log.warning("Override prompt error for %s: %s", rule_id, e)
-            return False  # Deny on error
+            log.warning("Agent prompt error: %s", e)
+            return None  # Treat as cancel
+        finally:
+            if target_agent and previous_status is not None:
+                restore_status = (
+                    previous_status
+                    if previous_status != AgentStatus.NEEDS_INPUT
+                    else AgentStatus.BUSY
+                )
+                target_agent._set_status(restore_status)
+
+    async def _show_advance_check_prompt(
+        self,
+        question: str,
+        context: dict[str, Any] | None = None,
+        agent: Agent | None = None,
+    ) -> bool:
+        """Show confirm prompt for manual-confirm advance checks.
+
+        Thin caller over _show_agent_prompt with phase context formatting.
+        """
+        # Build phase context header
+        header = "Confirm phase advance"
+        if context:
+            phase_id = context.get("phase_id", "")
+            idx = context.get("phase_index", 0)
+            total = context.get("phase_total", 0)
+            if phase_id and total:
+                header = f"Phase {idx}/{total}: {phase_id}"
+
+        target = agent or self._agent
+        agent_name = target.name if target else None
+
+        result = await self._show_agent_prompt(
+            title=f"[Advance check] {header}",
+            options=[
+                ("allow", "Advance to next phase"),
+                ("deny", "Stay on current phase"),
+            ],
+            subtitle=question,
+            agent=agent,
+            toast_message=(
+                f"Agent '{agent_name}' needs confirmation to advance"
+                if agent_name
+                else None
+            ),
+            toast_key=f"{target.id}:advance" if target else None,
+            post_deny_message=(
+                "Phase advance blocked. Agent will continue working on this phase."
+            ),
+        )
+        return result == "allow"
+
+    async def _show_override_prompt(
+        self,
+        rule_id: str,
+        description: str,
+        agent: Agent | None = None,
+    ) -> bool:
+        """Show override prompt for deny-level guardrail rules.
+
+        Thin caller over _show_agent_prompt with rule context formatting.
+        """
+        target = agent or self._agent
+        agent_name = target.name if target else None
+
+        result = await self._show_agent_prompt(
+            title=f"[Override] Rule: {rule_id}",
+            options=[
+                ("allow", "Allow -- approve this specific action"),
+                ("deny", "Deny -- block this action"),
+            ],
+            subtitle=description,
+            agent=agent,
+            toast_message=(
+                f"Agent '{agent_name}' needs override approval for {rule_id}"
+                if agent_name
+                else None
+            ),
+            toast_key=f"{target.id}:{rule_id}" if target else None,
+            post_deny_message="Override denied.",
+        )
+        return result == "allow"
 
     def _merged_hooks(
         self, agent_type: str | None = None
@@ -1673,11 +1823,21 @@ class ChatApp(App):
 
         return persist
 
-    def _make_confirm_callback(self):
-        """Create async confirm callback for ManualConfirm checks."""
+    def _make_confirm_callback(self, agent=None):
+        """Create async confirm callback for manual-confirm advance checks.
 
-        async def confirm(message: str) -> bool:
-            return await self._show_override_prompt("advance-check", message)
+        Args:
+            agent: The agent requesting confirmation. Used to set
+                NEEDS_INPUT status and show toast if not active.
+                If None, uses the currently active agent.
+        """
+
+        async def confirm(message: str, context: dict[str, Any] | None = None) -> bool:
+            return await self._show_advance_check_prompt(
+                message,
+                context=context,
+                agent=agent,
+            )
 
         return confirm
 

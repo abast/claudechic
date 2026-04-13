@@ -7,6 +7,7 @@ This is the orchestration layer — imports from checks/ and hints/.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -85,6 +86,7 @@ class WorkflowEngine:
         self._manifest = manifest
         self._persist_fn = persist_fn
         self._confirm_callback = confirm_callback
+        self._advance_lock = asyncio.Lock()  # Prevent concurrent advance
 
         # Phase state — in-memory, persisted via callback
         self._current_phase: str | None = None
@@ -146,6 +148,9 @@ class WorkflowEngine:
         short-circuit on first failure. On failure, bridges to hints
         pipeline via CheckFailed adapter.
 
+        Uses asyncio.Lock to prevent concurrent advance attempts from
+        showing double prompts.
+
         Args:
             workflow_id: Must match this engine's workflow_id.
             current_phase: Expected current phase (validated).
@@ -155,66 +160,75 @@ class WorkflowEngine:
         Returns:
             PhaseAdvanceResult with success/failure and details.
         """
-        # Validate preconditions
-        if workflow_id != self._manifest.workflow_id:
-            return PhaseAdvanceResult(
-                success=False,
-                reason=f"Workflow mismatch: expected {self._manifest.workflow_id}, got {workflow_id}",
-            )
-
-        if self._current_phase != current_phase:
-            return PhaseAdvanceResult(
-                success=False,
-                reason=f"Phase mismatch: engine is at {self._current_phase}, not {current_phase}",
-            )
-
-        if next_phase not in self._phase_index:
-            return PhaseAdvanceResult(
-                success=False,
-                reason=f"Unknown target phase: {next_phase}",
-            )
-
-        # Execute checks sequentially — AND semantics, short-circuit
-        for check_decl in advance_checks:
-            result = await self._run_single_check(check_decl)
-            if not result.passed:
-                # Bridge failure to hints pipeline
-                hint_data = None
-                if check_decl.on_failure:
-                    on_failure = OnFailureConfig(
-                        message=check_decl.on_failure.get("message", "Check failed"),
-                        severity=check_decl.on_failure.get("severity", "warning"),
-                        lifecycle=check_decl.on_failure.get(
-                            "lifecycle", "show-until-resolved"
-                        ),
-                    )
-                    hint_data = check_failed_to_hint(result, on_failure, check_decl.id)
-
-                logger.info(
-                    "Phase advance blocked: %s failed — %s",
-                    check_decl.id,
-                    result.evidence,
-                )
+        async with self._advance_lock:
+            # Validate preconditions
+            if workflow_id != self._manifest.workflow_id:
                 return PhaseAdvanceResult(
                     success=False,
-                    reason=f"Check '{check_decl.id}' failed: {result.evidence}",
-                    failed_check_id=check_decl.id,
-                    hint_data=hint_data,
+                    reason=f"Workflow mismatch: expected {self._manifest.workflow_id}, got {workflow_id}",
                 )
 
-        # All checks passed — advance phase
-        self._current_phase = next_phase
-        logger.info(
-            "Phase advanced: %s -> %s (workflow: %s)",
-            current_phase,
-            next_phase,
-            workflow_id,
-        )
+            if self._current_phase != current_phase:
+                return PhaseAdvanceResult(
+                    success=False,
+                    reason=f"Phase mismatch: engine is at {self._current_phase}, not {current_phase}",
+                )
 
-        # Persist via callback
-        await self._persist()
+            if next_phase not in self._phase_index:
+                return PhaseAdvanceResult(
+                    success=False,
+                    reason=f"Unknown target phase: {next_phase}",
+                )
 
-        return PhaseAdvanceResult(success=True, reason=f"Advanced to {next_phase}")
+            # Execute checks sequentially — AND semantics, short-circuit
+            for check_decl in advance_checks:
+                result = await self._run_single_check(check_decl)
+                if not result.passed:
+                    # Bridge failure to hints pipeline
+                    hint_data = None
+                    if check_decl.on_failure:
+                        on_failure = OnFailureConfig(
+                            message=check_decl.on_failure.get(
+                                "message", "Check failed"
+                            ),
+                            severity=check_decl.on_failure.get(
+                                "severity", "warning"
+                            ),
+                            lifecycle=check_decl.on_failure.get(
+                                "lifecycle", "show-until-resolved"
+                            ),
+                        )
+                        hint_data = check_failed_to_hint(
+                            result, on_failure, check_decl.id
+                        )
+
+                    logger.info(
+                        "Phase advance blocked: %s failed -- %s",
+                        check_decl.id,
+                        result.evidence,
+                    )
+                    return PhaseAdvanceResult(
+                        success=False,
+                        reason=f"Check '{check_decl.id}' failed: {result.evidence}",
+                        failed_check_id=check_decl.id,
+                        hint_data=hint_data,
+                    )
+
+            # All checks passed — advance phase
+            self._current_phase = next_phase
+            logger.info(
+                "Phase advanced: %s -> %s (workflow: %s)",
+                current_phase,
+                next_phase,
+                workflow_id,
+            )
+
+            # Persist via callback
+            await self._persist()
+
+            return PhaseAdvanceResult(
+                success=True, reason=f"Advanced to {next_phase}"
+            )
 
     # ------------------------------------------------------------------
     # Setup checks (global, no short-circuit)
@@ -299,6 +313,20 @@ class WorkflowEngine:
             params = dict(check_decl.params)
             if check_decl.type == "manual-confirm":
                 params["confirm_fn"] = self._confirm_callback
+                # Inject phase context at invocation time (not closure time)
+                current = self._current_phase
+                phase_order = self._phase_order
+                phase_index = (
+                    phase_order.index(current) + 1
+                    if current in phase_order
+                    else 0
+                )
+                params["context"] = {
+                    "phase_id": current,
+                    "phase_index": phase_index,
+                    "phase_total": len(phase_order),
+                    "check_id": check_decl.id,
+                }
 
             # Build check from registry using potentially modified params
             augmented_decl = CheckDecl(

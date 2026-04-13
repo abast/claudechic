@@ -68,6 +68,7 @@ exclude = ["build", ".venv", "dist", "site", "**/__pycache__"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
+    "fast: fast unit tests (default tier, under 1s each)",
     "integration: integration tests (may be slower, uses more complex mocking)",
 ]
 

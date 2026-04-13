@@ -199,6 +199,7 @@ class SelectionPrompt(BasePrompt):
         title: str,
         options: Sequence[tuple[str, str]],
         text_option: tuple[str, str] | None = None,
+        subtitle: str | None = None,
     ) -> None:
         """Create selection prompt.
 
@@ -207,11 +208,13 @@ class SelectionPrompt(BasePrompt):
             options: List of (value, label) tuples
             text_option: Optional (value_prefix, placeholder) for text input option.
                          Result will be f"{value_prefix}:{user_text}"
+            subtitle: Optional detail text shown below the title.
         """
         super().__init__()
         self.title = title
         self.options = options
         self.text_option = text_option
+        self.subtitle = subtitle
         self._result_value = options[0][0] if options else ""
 
     def compose(self) -> ComposeResult:
@@ -220,6 +223,8 @@ class SelectionPrompt(BasePrompt):
         self.styles.min_height = min_h
 
         yield Static(self.title, classes="prompt-title", markup=False)
+        if self.subtitle:
+            yield Static(self.subtitle, classes="prompt-subtitle", markup=False)
         for i, (_value, label) in enumerate(self.options):
             classes = "prompt-option selected" if i == 0 else "prompt-option"
             yield Static(

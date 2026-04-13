@@ -6,6 +6,7 @@ import asyncio
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from claudechic.checks.protocol import (
     AsyncConfirmCallback,
@@ -118,13 +119,19 @@ class ManualConfirm:
     AsyncConfirmCallback at construction -- never sees the TUI.
     """
 
-    def __init__(self, question: str, confirm_fn: AsyncConfirmCallback) -> None:
+    def __init__(
+        self,
+        question: str,
+        confirm_fn: AsyncConfirmCallback,
+        context: dict[str, Any] | None = None,
+    ) -> None:
         self.question = question
         self.confirm_fn = confirm_fn
+        self.context = context
 
     async def check(self) -> CheckResult:
         try:
-            confirmed = await self.confirm_fn(self.question)
+            confirmed = await self.confirm_fn(self.question, self.context)
             if confirmed:
                 return CheckResult(passed=True, evidence="User confirmed")
             return CheckResult(passed=False, evidence="User declined")
@@ -153,5 +160,6 @@ register_check_type(
     lambda p: ManualConfirm(
         question=p.get("question") or p.get("prompt", "Confirm?"),
         confirm_fn=p["confirm_fn"],
+        context=p.get("context"),
     ),
 )

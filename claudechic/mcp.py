@@ -809,71 +809,92 @@ def _format_tool_input(tool_input: dict) -> str:
 # --- Workflow MCP tools ---
 
 
-@tool(
-    "advance_phase",
-    "Advance the active workflow to its next phase. Engine runs advance_checks (AND semantics, short-circuit). Returns whether the transition succeeded.",
-    {},
-)
-async def advance_phase(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
-    """Attempt to advance the active workflow to its next phase."""
-    if _app is None or _app._workflow_engine is None:
-        return _error_response("No active workflow")
-    _track_mcp_tool("advance_phase")
+def _make_advance_phase(caller_name: str | None = None):
+    """Create advance_phase tool with caller name bound."""
 
-    engine = _app._workflow_engine
-    current = engine.get_current_phase()
-    if current is None:
-        return _error_response("No current phase set")
-
-    next_phase = engine.get_next_phase(current)
-    if next_phase is None:
-        return _error_response(f"No phase after '{current}' — already at final phase")
-
-    result = await engine.attempt_phase_advance(
-        workflow_id=engine.workflow_id,
-        current_phase=current,
-        next_phase=next_phase,
-        advance_checks=engine.get_advance_checks_for(current),
+    @tool(
+        "advance_phase",
+        "Advance the active workflow to its next phase. Engine runs advance_checks (AND semantics, short-circuit). Returns whether the transition succeeded.",
+        {},
     )
+    async def advance_phase(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+        """Attempt to advance the active workflow to its next phase."""
+        if _app is None or _app._workflow_engine is None:
+            return _error_response("No active workflow")
+        _track_mcp_tool("advance_phase")
 
-    if result.success:
-        # Build phase prompt content synchronously so the calling agent
-        # gets the new phase instructions in the tool response (not later
-        # via async broadcast, which caused BUG #1: late/out-of-order
-        # phase injections).
-        phase_content = ""
-        main_role = getattr(engine.manifest, "main_role", None)
-        if main_role:
-            try:
-                from claudechic.workflows.agent_folders import assemble_phase_prompt
+        engine = _app._workflow_engine
 
-                phase_content = (
-                    assemble_phase_prompt(
-                        workflows_dir=Path.cwd() / "workflows",
-                        workflow_id=engine.workflow_id,
-                        role_name=main_role,
-                        current_phase=next_phase,
-                    )
-                    or ""
+        # Resolve calling agent for NEEDS_INPUT status
+        caller_agent = None
+        if caller_name and _app.agent_mgr:
+            caller_agent = _app.agent_mgr.find_by_name(caller_name)
+
+        # Temporarily set agent-aware confirm callback
+        original_cb = engine._confirm_callback
+        engine._confirm_callback = _app._make_confirm_callback(agent=caller_agent)
+        try:
+            current = engine.get_current_phase()
+            if current is None:
+                return _error_response("No current phase set")
+
+            next_phase = engine.get_next_phase(current)
+            if next_phase is None:
+                return _error_response(
+                    f"No phase after '{current}' -- already at final phase"
                 )
-            except Exception:
-                log.debug(
-                    "Failed to assemble phase prompt for advance_phase response",
-                    exc_info=True,
-                )
 
-            # Still broadcast to OTHER agents asynchronously so they get
-            # the phase update too (the caller already has it inline).
-            _app._inject_phase_prompt_to_main_agent(
-                engine.workflow_id, main_role, next_phase
+            result = await engine.attempt_phase_advance(
+                workflow_id=engine.workflow_id,
+                current_phase=current,
+                next_phase=next_phase,
+                advance_checks=engine.get_advance_checks_for(current),
             )
 
-        response = f"Advanced to phase: {next_phase}"
-        if phase_content:
-            response += f"\n\n--- Phase Instructions ---\n\n{phase_content}"
-        return _text_response(response)
-    else:
-        return _error_response(f"Advance blocked: {result.reason}")
+            if result.success:
+                # Build phase prompt content synchronously so the calling agent
+                # gets the new phase instructions in the tool response (not later
+                # via async broadcast, which caused BUG #1: late/out-of-order
+                # phase injections).
+                phase_content = ""
+                main_role = getattr(engine.manifest, "main_role", None)
+                if main_role:
+                    try:
+                        from claudechic.workflows.agent_folders import (
+                            assemble_phase_prompt,
+                        )
+
+                        phase_content = (
+                            assemble_phase_prompt(
+                                workflows_dir=Path.cwd() / "workflows",
+                                workflow_id=engine.workflow_id,
+                                role_name=main_role,
+                                current_phase=next_phase,
+                            )
+                            or ""
+                        )
+                    except Exception:
+                        log.debug(
+                            "Failed to assemble phase prompt for advance_phase response",
+                            exc_info=True,
+                        )
+
+                    # Still broadcast to OTHER agents asynchronously so they get
+                    # the phase update too (the caller already has it inline).
+                    _app._inject_phase_prompt_to_main_agent(
+                        engine.workflow_id, main_role, next_phase
+                    )
+
+                response = f"Advanced to phase: {next_phase}"
+                if phase_content:
+                    response += f"\n\n--- Phase Instructions ---\n\n{phase_content}"
+                return _text_response(response)
+            else:
+                return _error_response(f"Advance blocked: {result.reason}")
+        finally:
+            engine._confirm_callback = original_cb
+
+    return advance_phase
 
 
 @tool(
@@ -932,55 +953,67 @@ async def get_phase(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
     return _text_response("\n".join(lines))
 
 
-@tool(
-    "request_override",
-    "Request user approval to override a deny-level rule. User sees the exact command. If approved, stores a one-time token — retry the exact same command to execute it.",
-    {
-        "type": "object",
-        "properties": {
-            "rule_id": {
-                "type": "string",
-                "description": "The qualified ID of the blocking rule (from block message)",
+def _make_request_override(caller_name: str | None = None):
+    """Create request_override tool with caller name bound."""
+
+    @tool(
+        "request_override",
+        "Request user approval to override a deny-level rule. User sees the exact command. If approved, stores a one-time token -- retry the exact same command to execute it.",
+        {
+            "type": "object",
+            "properties": {
+                "rule_id": {
+                    "type": "string",
+                    "description": "The qualified ID of the blocking rule (from block message)",
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": "The tool that was blocked",
+                },
+                "tool_input": {
+                    "type": "object",
+                    "description": "The exact tool input dict that was blocked",
+                },
             },
-            "tool_name": {
-                "type": "string",
-                "description": "The tool that was blocked",
-            },
-            "tool_input": {
-                "type": "object",
-                "description": "The exact tool input dict that was blocked",
-            },
+            "required": ["rule_id", "tool_name", "tool_input"],
         },
-        "required": ["rule_id", "tool_name", "tool_input"],
-    },
-)
-async def request_override(args: dict[str, Any]) -> dict[str, Any]:
-    """Request user approval to override a deny-level rule."""
-    if _app is None or _app._token_store is None:
-        return _error_response("App not initialized")
-    _track_mcp_tool("request_override")
-
-    rule_id = args["rule_id"]
-    tool_name = args["tool_name"]
-    tool_input = args.get("tool_input", {})
-
-    description = (
-        f"Agent wants to run blocked action:\n"
-        f"  Tool: {tool_name}\n"
-        f"  Input: {_format_tool_input(tool_input)}\n"
-        f"  Blocked by: {rule_id}\n"
-        f"Approve this specific action?"
     )
+    async def request_override(args: dict[str, Any]) -> dict[str, Any]:
+        """Request user approval to override a deny-level rule."""
+        if _app is None or _app._token_store is None:
+            return _error_response("App not initialized")
+        _track_mcp_tool("request_override")
 
-    approved = await _app._show_override_prompt(rule_id, description)
+        rule_id = args["rule_id"]
+        tool_name = args["tool_name"]
+        tool_input = args.get("tool_input", {})
 
-    if approved:
-        _app._token_store.store(rule_id, tool_name, tool_input, enforcement="deny")
-        return _text_response(
-            f"Override approved for rule {rule_id}. Retry the exact same command."
+        description = (
+            f"Agent wants to run blocked action:\n"
+            f"  Tool: {tool_name}\n"
+            f"  Input: {_format_tool_input(tool_input)}\n"
+            f"  Blocked by: {rule_id}\n"
+            f"Approve this specific action?"
         )
-    else:
-        return _text_response("Override denied.")
+
+        # Resolve calling agent for NEEDS_INPUT status
+        caller_agent = None
+        if caller_name and _app.agent_mgr:
+            caller_agent = _app.agent_mgr.find_by_name(caller_name)
+
+        approved = await _app._show_override_prompt(
+            rule_id, description, agent=caller_agent,
+        )
+
+        if approved:
+            _app._token_store.store(rule_id, tool_name, tool_input, enforcement="deny")
+            return _text_response(
+                f"Override approved for rule {rule_id}. Retry the exact same command."
+            )
+        else:
+            return _text_response("Override denied.")
+
+    return request_override
 
 
 @tool(
@@ -1038,9 +1071,9 @@ def create_chic_server(caller_name: str | None = None):
         _make_close_agent(caller_name),
         _make_interrupt_agent(caller_name),
         # Workflow guidance tools
-        advance_phase,
+        _make_advance_phase(caller_name),
         get_phase,
-        request_override,
+        _make_request_override(caller_name),
         acknowledge_warning,
     ]
 

@@ -15,10 +15,15 @@ class CheckResult:
     evidence: str
 
 
-AsyncConfirmCallback = Callable[[str], Awaitable[bool]]
-"""The seam between ManualConfirm and TUI.
-ManualConfirm calls: await callback(question) -> bool
-The engine creates the callback, closing over app._show_prompt.
+AsyncConfirmCallback = Callable[[str, dict[str, Any] | None], Awaitable[bool]]
+"""The seam between ManualConfirm and the TUI.
+
+ManualConfirm calls: await callback(question, context) -> bool
+  - question: the prompt string from YAML
+  - context: optional dict with phase metadata (may be None)
+    Keys when present: "phase_id", "phase_index", "phase_total", "check_id"
+
+The engine creates the callback, closing over app methods.
 ManualConfirm never imports anything from claudechic.widgets or app.
 """
 

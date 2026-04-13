@@ -558,6 +558,11 @@ WorktreePrompt, ModelPrompt {
     padding: 0 0 1 0;
 }
 
+.prompt-subtitle {
+    color: $text-muted;
+    padding: 0 0 1 0;
+}
+
 .prompt-option {
     padding: 0 0 0 1;
     color: $text-muted;
