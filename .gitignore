@@ -14,6 +14,7 @@ wheels/
 
 # Test artifacts
 test_write*.txt
+.test_results/
 site/
 uv.lock
 
