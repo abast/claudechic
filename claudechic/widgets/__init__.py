@@ -37,9 +37,11 @@ from claudechic.widgets.input import HistorySearch, TextAreaAutoComplete
 
 # Layout widgets
 from claudechic.widgets.layout import (
+    ActionButton,
     AgentItem,
     AgentSection,
     ChatView,
+    ChicsessionActions,
     ChicsessionLabel,
     ContextBar,
     CPUBar,
@@ -118,9 +120,11 @@ __all__ = [
     "TextAreaAutoComplete",
     "HistorySearch",
     # Layout
+    "ActionButton",
     "ChatView",
     "AgentItem",
     "AgentSection",
+    "ChicsessionActions",
     "ChicsessionLabel",
     "WorktreeItem",
     "SessionItem",

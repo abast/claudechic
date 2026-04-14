@@ -21,8 +21,10 @@ from claudechic.widgets.layout.reviews import (
     ReviewPanel,
 )
 from claudechic.widgets.layout.sidebar import (
+    ActionButton,
     AgentItem,
     AgentSection,
+    ChicsessionActions,
     ChicsessionLabel,
     FileItem,
     FilesSection,
@@ -36,9 +38,11 @@ from claudechic.widgets.layout.sidebar import (
 )
 
 __all__ = [
+    "ActionButton",
     "ChatView",
     "AgentItem",
     "AgentSection",
+    "ChicsessionActions",
     "ChicsessionLabel",
     "WorktreeItem",
     "PlanItem",

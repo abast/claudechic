@@ -79,7 +79,9 @@ class DiffScreen(Screen[list[HunkComment]]):
         # Build diff UI
         container = Horizontal(id="diff-container")
         self._sidebar = DiffSidebar(changes, id="diff-sidebar")
-        self._view = DiffView(changes, id="diff-view")
+        # cwd is passed through so FileDiffPanel can read .md files for preview.
+        # Without it, FileDiffPanel._cwd is None and _show_preview() returns early.
+        self._view = DiffView(changes, cwd=self._cwd, id="diff-view")
 
         self.mount(container)
         container.mount(self._sidebar)

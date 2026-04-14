@@ -81,6 +81,7 @@ from claudechic.widgets import (
     ChatInput,
     ChatMessage,
     ChatView,
+    ChicsessionActions,
     ConnectingIndicator,
     ContextBar,
     EditPlanRequested,
@@ -103,6 +104,8 @@ from claudechic.widgets import (
     WorktreeItem,
 )
 from claudechic.widgets.layout.footer import (
+    AgentLabel,
+    ComputerInfoLabel,
     DiagnosticsLabel,
     ModelLabel,
     PermissionModeLabel,
@@ -149,6 +152,9 @@ class ChatApp(App):
         Binding("ctrl+c", "copy_or_quit", "Copy/Quit", priority=True, show=False),
         Binding("ctrl+s", "screenshot", "Screenshot", show=False),
         # Agent switching: ctrl+1 through ctrl+9
+        Binding(
+            "ctrl+g", "open_agent_switcher", "Agent Switcher", priority=True, show=False
+        ),
         *[
             Binding(
                 f"ctrl+{i}",
@@ -338,6 +344,7 @@ class ChatApp(App):
 
         with contextlib.suppress(Exception):
             self.files_section.add_file(rel_path, additions, deletions)
+            self._position_right_sidebar()
 
     # Cached widget accessors (lazy init on first access)
     @property
@@ -374,6 +381,7 @@ class ChatApp(App):
                     Path(s.path): (s.additions, s.deletions, s.untracked) for s in stats
                 }
                 section.mount_all_files(files)
+                self._position_right_sidebar()
             else:
                 section.add_class("hidden")
         except Exception:
@@ -2272,6 +2280,7 @@ class ChatApp(App):
             or self.todo_panel.todos
             or (self._review_panel and self._review_panel.review_count)
             or self._workflow_engine
+            or self.files_section.item_count > 0
         )
         width = self.size.width
         main = self.query_one("#main", Horizontal)
@@ -2340,8 +2349,12 @@ class ChatApp(App):
         review_count = self._review_panel.review_count if self._review_panel else 0
         process_count = self.process_panel.process_count
         has_plan = self.plan_section.has_plan
+        files_count = self.files_section.item_count
 
         # Height costs (lines) - based on actual CSS
+        # ChicsessionLabel: title(1) + name(1) + actions-row(1) = 3 lines (no workflow)
+        #   + workflow(1) + phase(1) = 5 lines when workflow is active
+        chicsession_overhead = 3 + (2 if self._workflow_engine else 0)
         # AgentSection title: padding 1 1 1 1 = 3 lines (top + text + bottom)
         AGENT_SECTION_TITLE = 3
         AGENT_EXPANDED = 3  # height: 3 with padding
@@ -2357,9 +2370,13 @@ class ChatApp(App):
         PROCESS_ITEM = 1
         # PlanSection: border-top(1) + title(3) + item(3) = 7 lines
         PLAN_TOTAL = 7
+        # FilesSection: border-top(1) + files-header row(3) = 4 lines overhead
+        # (title + DiffButton share one Horizontal row, not stacked vertically)
+        FILES_OVERHEAD = 4
+        FILES_ITEM = 1
 
-        # Start with fixed costs: agent section title always present
-        used = AGENT_SECTION_TITLE
+        # Start with fixed costs: chicsession label + agent section title always present
+        used = chicsession_overhead + AGENT_SECTION_TITLE
 
         # Todos: high priority, always show if present
         if todo_count:
@@ -2368,16 +2385,33 @@ class ChatApp(App):
 
         remaining = height - used
 
-        # Agents: try expanded first, fall back to compact
+        # Reserve minimum space for files before the agent compact decision so
+        # agents don't greedily consume all remaining height. Without this, on a
+        # short terminal remaining is large enough that agents stay expanded even
+        # when doing so would push files off-screen. The reservation is restored
+        # to remaining after agents are sized, so files still get their fair share.
+        FILES_MIN_ROWS = 3  # minimum visible file rows (scroll handles the rest)
+        files_reserved = (FILES_OVERHEAD + FILES_MIN_ROWS) if files_count else 0
+        remaining_for_agents = remaining - files_reserved
+
+        # Agents: height-based compact decision (primary). Safety net at high count
+        # (COMPACT_SAFETY_NET) prevents sidebar sprawl when terminal is very tall
+        # but there are many agents; height-based logic handles normal cases.
+        COMPACT_SAFETY_NET = 12
         agents_expanded = agent_count * AGENT_EXPANDED
         agents_compact = agent_count * AGENT_COMPACT
 
-        if agents_expanded <= remaining:
+        if agents_expanded <= remaining_for_agents and agent_count <= COMPACT_SAFETY_NET:
             self.agent_section.set_compact(False)
-            remaining -= agents_expanded
+            agent_height = agents_expanded
         else:
             self.agent_section.set_compact(True)
-            remaining -= agents_compact
+            agent_height = agents_compact
+        remaining -= agent_height
+
+        # Set agent scroll max-height dynamically so the list scrolls rather
+        # than overflowing the sidebar when there are many agents.
+        self.agent_section._get_scroll().styles.max_height = max(3, agent_height)
 
         # Reviews: show if room
         if review_count and remaining >= REVIEW_OVERHEAD + review_count * REVIEW_ITEM:
@@ -2399,8 +2433,16 @@ class ChatApp(App):
         # Plan: lowest priority, show if room
         if has_plan and remaining >= PLAN_TOTAL:
             self.plan_section.set_visible(True)
+            remaining -= PLAN_TOTAL
         else:
             self.plan_section.set_visible(False)
+
+        # Files: allocate whatever remains after all other sections.
+        # max_height caps the scroll so items beyond the available space scroll
+        # rather than pushing the section off-screen.
+        if files_count:
+            files_scroll_height = max(1, remaining - FILES_OVERHEAD)
+            self.files_section._get_scroll().styles.max_height = files_scroll_height
 
     def on_response_complete(self, event: ResponseComplete) -> None:
         agent = self._get_agent(event.agent_id)
@@ -2510,6 +2552,27 @@ class ChatApp(App):
     def action_new_agent(self) -> None:
         """Create a new agent (prompts for name/path)."""
         self.notify("Use /agent <name> to create a new agent")
+
+    def action_open_agent_switcher(self) -> None:
+        """Open the agent switcher modal (Ctrl+G)."""
+        if not self.agent_mgr or len(self.agents) < 1:
+            return
+
+        from claudechic.widgets.modals.agent_switcher import AgentSwitcher
+
+        agents_list = [(agent.id, agent.name, agent.status) for agent in self.agent_mgr]
+        self.push_screen(AgentSwitcher(agents_list), self._on_agent_switcher_result)
+
+    def _on_agent_switcher_result(self, agent_id: str | None) -> None:
+        """Handle agent selection from AgentSwitcher modal."""
+        if agent_id and self.agent_mgr and agent_id in self.agents:
+            self.agent_mgr.switch(agent_id)
+
+    def on_agent_label_switcher_requested(
+        self, event: AgentLabel.SwitcherRequested
+    ) -> None:
+        """Handle click on AgentLabel to open the switcher."""
+        self.action_open_agent_switcher()
 
     def action_switch_agent(self, position: int) -> None:
         """Switch to agent by position (1-indexed)."""
@@ -3073,6 +3136,10 @@ class ChatApp(App):
         """Handle file item click - open diff view focused on that file."""
         self._toggle_diff_mode_for_file(str(event.file_path))
 
+    def on_diff_button_diff_requested(self, event) -> None:
+        """Handle /diff button click from FilesSection header - open full diff view."""
+        self._toggle_diff_mode()
+
     def on_hamburger_button_sidebar_toggled(
         self, event: HamburgerButton.SidebarToggled
     ) -> None:
@@ -3100,6 +3167,89 @@ class ChatApp(App):
         session_id = agent.session_id if agent else None
         cwd = agent.cwd if agent else None
         self.push_screen(DiagnosticsModal(session_id=session_id, cwd=cwd))
+
+    def on_computer_info_label_requested(self, event: ComputerInfoLabel.Requested) -> None:  # noqa: ARG002
+        """Handle sys label press - open computer info modal."""
+        from claudechic.widgets.modals.computer_info import ComputerInfoModal
+
+        agent = self._agent
+        cwd = agent.cwd if agent else None
+        self.push_screen(ComputerInfoModal(cwd=cwd))
+
+    def on_chicsession_actions_workflow_picker_requested(
+        self,
+        event: ChicsessionActions.WorkflowPickerRequested,  # noqa: ARG002
+    ) -> None:
+        """Handle Workflows button - open workflow picker screen."""
+        from claudechic.screens.workflow_picker import WorkflowPickerScreen
+
+        if not self._workflow_registry:
+            self.notify(
+                "No workflows discovered. Check your workflow directories.",
+                severity="warning",
+            )
+            return
+
+        def on_dismiss(result: str | None) -> None:
+            if result:
+                if (
+                    self._workflow_engine
+                    and self._workflow_engine.workflow_id == result
+                ):
+                    # Already active — ask before resetting phase to beginning
+                    phase_id = self._workflow_engine.current_phase_id
+                    wf_id = result
+
+                    async def _confirm_restart() -> None:
+                        choice = await self._show_agent_prompt(
+                            f"'{wf_id}' is active (phase: {phase_id}). Restart from the beginning?",
+                            [("yes", "Yes, restart from the beginning"), ("no", "No, keep current phase")],
+                        )
+                        if choice == "yes":
+                            await self._activate_workflow(wf_id)
+
+                    self.run_worker(_confirm_restart(), exit_on_error=False)
+                else:
+                    self.run_worker(self._activate_workflow(result))
+            if hasattr(self, "chat_input") and self.chat_input:
+                self.chat_input.focus()
+
+        # Build picker data with phase count and role from the loaded manifest.
+        # _workflow_registry is dict[str, Path]; WorkflowPickerScreen expects
+        # dict[str, dict] with main_role, phase_count, is_active.
+        picker_data: dict = {}
+        for wf_id in self._workflow_registry:
+            wf_data = self._load_result.get_workflow(wf_id) if self._load_result else None
+            phase_count = (
+                sum(1 for p in self._load_result.phases if p.namespace == wf_id)
+                if self._load_result
+                else 0
+            )
+            picker_data[wf_id] = {
+                "main_role": wf_data.main_role if wf_data else "",
+                "phase_count": phase_count,
+                "is_active": bool(
+                    self._workflow_engine
+                    and self._workflow_engine.workflow_id == wf_id
+                ),
+            }
+        self.push_screen(WorkflowPickerScreen(picker_data), on_dismiss)
+
+    def on_chicsession_actions_restore_requested(
+        self,
+        event: ChicsessionActions.RestoreRequested,  # noqa: ARG002
+    ) -> None:
+        """Handle Restore button - open chicsession picker."""
+        from claudechic.chicsession_cmd import _show_restore_picker
+
+        _show_restore_picker(self)
+
+    def on_chicsession_actions_stop_requested(
+        self,
+        event: ChicsessionActions.StopRequested,  # noqa: ARG002
+    ) -> None:
+        """Handle Stop button - deactivate the current workflow."""
+        self._deactivate_workflow()
 
     def _close_sidebar_overlay(self) -> None:
         """Close sidebar overlay if open."""
@@ -3595,6 +3745,24 @@ class ChatApp(App):
 
             # Refresh autocomplete with new agent
             self._refresh_dynamic_completions()
+
+            # Update AgentLabel in footer
+            agent_count = len(self.agent_mgr.agents) if self.agent_mgr else 1
+            self.status_footer.update_agent_label(agent.name, visible=(agent_count > 1))
+
+            # Hint: show Ctrl+G tip when agent count first reaches 2
+            if agent_count == 2:
+                from claudechic.hints.state import HintStateStore
+
+                store = HintStateStore(self._cwd)
+                if store.get_times_shown("agent-switcher-tip") == 0:
+                    self.notify(
+                        "Tip: Press Ctrl+G to switch between agents",
+                        severity="information",
+                        timeout=8,
+                    )
+                    store.increment_shown("agent-switcher-tip")
+                    store.save()
         except Exception as e:
             log.exception(f"Failed to create agent UI: {e}")
 
@@ -3650,6 +3818,8 @@ class ChatApp(App):
         # Update footer
         self.status_footer.permission_mode = new_agent.permission_mode
         self._update_footer_model(new_agent.model)
+        agent_count = len(self.agent_mgr.agents) if self.agent_mgr else 1
+        self.status_footer.update_agent_label(new_agent.name, visible=(agent_count > 1))
 
         # Update todo panel and context
         self.todo_panel.update_todos(new_agent.todos)
@@ -3724,6 +3894,12 @@ class ChatApp(App):
 
         # Refresh autocomplete after agent closed
         self._refresh_dynamic_completions()
+
+        # Update AgentLabel visibility
+        agent_count = len(self.agent_mgr.agents) if self.agent_mgr else 0
+        active = self.agent_mgr.active if self.agent_mgr else None
+        active_name = active.name if active else ""
+        self.status_footer.update_agent_label(active_name, visible=(agent_count > 1))
 
     def on_global_permission_mode_changed(self, mode: str) -> None:
         """Handle global permission mode change (applies to all agents)."""

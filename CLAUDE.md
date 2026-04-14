@@ -45,11 +45,20 @@ claudechic/
 │       ├── __init__.py   # Public API (list_worktrees, handle_worktree_command)
 │       ├── commands.py   # /worktree command handlers
 │       └── git.py        # Git worktree operations
+├── hints/             # Hints pipeline (LEAF: stdlib only, no upward imports)
+│   ├── __init__.py    # Package marker
+│   ├── engine.py      # 6-stage hint evaluation pipeline
+│   ├── parsers.py     # Manifest section parser for hints YAML
+│   ├── state.py       # HintStateStore - persistence to .claude/hints_state.json
+│   └── types.py       # HintSpec, HintDecl, HintRecord, HintLifecycle, TriggerCondition
 ├── processes.py       # BackgroundProcess dataclass, child process detection
 ├── screens/           # Full-page screens (navigation)
 │   ├── chat.py        # ChatScreen - main chat UI (default screen)
 │   ├── diff.py        # DiffScreen - review uncommitted changes
-│   └── session.py     # SessionScreen - session browser for /resume
+│   ├── session.py     # SessionScreen - session browser for /resume
+│   ├── chicsession.py # ChicsessionScreen - chicsession picker and workflow activation
+│   ├── rewind.py      # RewindScreen - checkpoint selection
+│   └── workflow_picker.py # WorkflowPickerScreen - workflow selection UI
 └── widgets/
     ├── __init__.py    # Re-exports all widgets for backward compat
     ├── prompts.py     # All prompt widgets (Selection, Question, Model, Worktree)
@@ -66,13 +75,15 @@ claudechic/
     │   ├── message.py # ChatMessage, ChatInput, ThinkingIndicator
     │   ├── tools.py   # ToolUseWidget, TaskWidget, AgentToolWidget
     │   ├── diff.py    # Syntax-highlighted diff widget
-    │   └── todo.py    # TodoPanel, TodoWidget
+    │   ├── todo.py    # TodoPanel, TodoWidget
+    │   ├── markdown_preview.py # PreviewToggle, MarkdownPreviewModal
+    │   └── collapsed_turn.py   # CollapsedTurn - lightweight collapsed user+assistant turn
     ├── input/         # User input widgets
     │   ├── autocomplete.py # TextAreaAutoComplete
     │   └── history_search.py # HistorySearch (Ctrl+R)
     ├── layout/        # Structural/container widgets
     │   ├── chat_view.py # ChatView - renders agent messages
-    │   ├── sidebar.py # AgentSidebar, AgentItem, WorktreeItem
+    │   ├── sidebar.py # AgentSection, AgentItem, WorktreeItem, ChicsessionLabel, ChicsessionActions, ActionButton, DiffButton, FilesSection
     │   ├── footer.py  # StatusFooter, AutoEditLabel, ModelLabel
     │   ├── indicators.py # IndicatorWidget, CPUBar, ContextBar, ProcessIndicator
     │   └── processes.py # ProcessPanel, ProcessItem
@@ -80,8 +91,13 @@ claudechic/
     │   ├── context.py # ContextReport - visual 2D grid
     │   └── usage.py   # UsageReport, UsageBar
     └── modals/        # Modal screen overlays
-        ├── profile.py # ProfileModal - profiling stats
-        └── process_modal.py # ProcessModal
+        ├── base.py          # InfoModal - reusable base for labeled info sections
+        ├── profile.py       # ProfileModal - profiling stats
+        ├── process_modal.py # ProcessModal - process list
+        ├── process_detail.py # ProcessDetailModal - single process detail, kill, metrics
+        ├── computer_info.py # ComputerInfoModal - host, OS, Python, SDK, CWD (sys button)
+        ├── agent_switcher.py # AgentSwitcher - Ctrl+G modal to search and switch agents
+        └── diagnostics.py   # DiagnosticsModal - session JSONL path, compaction summary
 
 tests/
 ├── __init__.py        # Package marker
@@ -90,7 +106,11 @@ tests/
 ├── test_app_ui.py     # App UI tests without SDK
 ├── test_autocomplete.py # Autocomplete widget tests
 ├── test_file_index.py # Fuzzy file search tests
-└── test_widgets.py    # Pure widget tests
+├── test_widgets.py    # Pure widget tests
+├── test_agent_switcher.py    # AgentSwitcher modal and hint tests
+├── test_chicsession_actions.py # ChicsessionActions widget tests
+├── test_diff_preview.py      # DiffScreen PreviewToggle tests (visibility, rendering, cwd wiring)
+└── test_workflow_restore.py  # Workflow restore / chicsession integration tests
 ```
 
 ## Architecture

@@ -39,6 +39,8 @@ Review uncommitted changes before asking Claude to commit:
 
 Opens a full-screen diff view with syntax highlighting. You can add comments in the input area—when you submit, Claude sees both the diff and your comments. Press `Escape` to return to chat without sending.
 
+For markdown files (`.md`), a `[Preview]` button appears next to the file header. Click it to toggle between the raw diff hunks and a rendered markdown preview of the current file. Click `[Diff]` to switch back.
+
 <video src="https://github.com/user-attachments/assets/3c0c262b-2a23-4486-92c4-b97705a0819d" autoplay loop muted playsinline></video>
 
 ## Vim Mode
@@ -72,3 +74,15 @@ Claude Chic collects anonymous usage analytics to help improve the project. You 
 ```
 
 Analytics are **opt-in by default** for new installations. Data collected includes feature usage patterns (which commands are used) but never conversation content.
+
+## Sidebar Files
+
+The files section in the sidebar shows uncommitted changes in the current working tree. Files appear automatically when changes exist—no command needed. Click the `/diff` button in the sidebar to open the full diff review screen.
+
+## System Info
+
+Click `sys` in the bottom status bar to open a modal showing system information: hostname, OS, Python version, SDK version, and the current working directory.
+
+## Agent Switcher
+
+Press `Ctrl+G` to open the agent switcher when multiple agents are active. The switcher lets you search agents by name and jump directly to one. A hint appears the first time you spawn a second agent pointing you to this shortcut.

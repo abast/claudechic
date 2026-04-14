@@ -1,5 +1,7 @@
 """Pure widget tests - no SDK needed."""
 
+import re
+
 import pytest
 from claudechic.enums import AgentStatus
 from claudechic.widgets import (
@@ -930,3 +932,257 @@ async def test_selection_prompt_no_subtitle():
         prompt = app.query_one(SelectionPrompt)
         subtitles = list(prompt.query(".prompt-subtitle"))
         assert len(subtitles) == 0
+
+
+@pytest.mark.asyncio
+async def test_sidebar_handles_many_agents_without_overflow():
+    """12 agents forces compact mode and scrollable container."""
+    from claudechic.widgets.layout.sidebar import AgentItem
+
+    app = WidgetTestApp(lambda: AgentSection(id="agents"))
+    async with app.run_test() as pilot:
+        section = app.query_one(AgentSection)
+
+        # Add 12 agents
+        for i in range(12):
+            section.add_agent(f"id-{i}", f"Agent-{i}")
+        await pilot.pause()
+
+        # All AgentItems should have the compact CSS class (>6 forces compact)
+        items = list(section.query(AgentItem))
+        assert len(items) == 12, f"Expected 12 AgentItems, got {len(items)}"
+        assert all(item.has_class("compact") for item in items), (
+            "All items should have 'compact' CSS class when >6 agents"
+        )
+
+        # VerticalScroll#agent-scroll should exist as container
+        from textual.containers import VerticalScroll
+
+        scroll = section.query_one("#agent-scroll", VerticalScroll)
+        assert scroll is not None, "VerticalScroll#agent-scroll must exist"
+
+        # All 12 items should be queryable with no display:none
+        for item in items:
+            assert item.display is True, (
+                f"AgentItem {item.agent_id} should not have display:none"
+            )
+
+
+# --- ComputerInfoLabel + ComputerInfoModal tests ---
+
+
+@pytest.mark.asyncio
+async def test_sys_label_click_opens_computer_info_modal():
+    """Click #computer-info-label opens ComputerInfoModal with system info sections."""
+    from claudechic.widgets.layout.footer import ComputerInfoLabel
+    from claudechic.widgets.modals.computer_info import ComputerInfoModal
+
+    class SysTestApp(App):
+        def compose(self) -> ComposeResult:
+            yield StatusFooter()
+
+        def on_computer_info_label_requested(
+            self, event: ComputerInfoLabel.Requested
+        ) -> None:
+            self.push_screen(ComputerInfoModal(cwd="/tmp"))
+
+    app = SysTestApp()
+    async with app.run_test(size=(80, 24)) as pilot:
+        # Verify label exists
+        label = app.query_one("#computer-info-label", ComputerInfoLabel)
+        assert label is not None
+
+        # Post the message (simulates a click on the label)
+        label.post_message(ComputerInfoLabel.Requested())
+        await pilot.pause()
+
+        # Assert ComputerInfoModal is on the screen stack
+        assert any(isinstance(s, ComputerInfoModal) for s in app.screen_stack), (
+            "ComputerInfoModal should be on screen stack"
+        )
+        modal = app.screen
+
+        # Check that sections have non-empty values
+        # The modal renders InfoSection items as Static widgets with class "info-value"
+        value_widgets = list(modal.query(".info-value"))
+        assert len(value_widgets) >= 6, (
+            f"Expected at least 6 info values, got {len(value_widgets)}"
+        )
+
+        # Build a dict of label -> value from the modal
+        label_widgets = list(modal.query(".info-label"))
+        info = {}
+        for lbl, val in zip(label_widgets, value_widgets, strict=True):
+            lbl_text = lbl.render().plain.strip().rstrip(":")
+            val_text = val.render().plain.strip()
+            info[lbl_text] = val_text
+
+        # Host, OS, Python, CWD must be non-empty
+        for key in ("Host", "OS", "Python", "CWD"):
+            assert key in info, f"Missing section: {key}"
+            assert info[key], f"Section {key} is empty"
+
+        # SDK and claudechic must be version strings or "unknown"
+        version_re = re.compile(r"^\d+\.\d+")
+        for key in ("SDK", "claudechic"):
+            assert key in info, f"Missing section: {key}"
+            val = info[key]
+            assert val == "unknown" or version_re.match(val), (
+                f"{key} should be a version string or 'unknown', got: {val!r}"
+            )
+
+        # Pressing Escape dismisses the modal
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert not any(isinstance(s, ComputerInfoModal) for s in app.screen_stack), (
+            "Modal should be dismissed after Escape"
+        )
+
+
+@pytest.mark.asyncio
+async def test_files_section_scrolls_with_many_files():
+    """FilesSection wraps items in a VerticalScroll with id='files-scroll'."""
+    from pathlib import Path
+
+    from claudechic.widgets import FilesSection
+    from claudechic.widgets.layout.sidebar import FileItem
+    from textual.containers import VerticalScroll
+
+    app = WidgetTestApp(lambda: FilesSection(id="files-section"))
+    async with app.run_test():
+        section = app.query_one(FilesSection)
+
+        # Add 20 files
+        for i in range(20):
+            section.add_file(Path(f"src/file_{i:02d}.py"), additions=i, deletions=0)
+
+        await app.workers.wait_for_complete()
+
+        # VerticalScroll with id="files-scroll" must exist inside FilesSection
+        scroll = section.query_one("#files-scroll", VerticalScroll)
+        assert scroll is not None, "FilesSection must contain a VerticalScroll#files-scroll"
+
+        # All 20 FileItems must be queryable
+        items = section.query(FileItem)
+        assert len(items) == 20, f"Expected 20 FileItems, got {len(items)}"
+
+        # No item should be display:none
+        for item in items:
+            assert item.display, f"FileItem {item.id} should not have display:none"
+
+
+@pytest.mark.asyncio
+async def test_files_section_visible_with_workflow_active(mock_sdk):
+    """_layout_sidebar_contents must compact agents when workflow is active.
+
+    Regression test for chicsession_overhead budget bug: with a workflow active,
+    ChicsessionLabel is 5 lines (title + name + workflow + phase + actions) but
+    the budget previously hardcoded 3. Files reserve a minimum of
+    FILES_OVERHEAD(4) + 3 = 7 lines before the agent compact decision.
+
+    Budget math at H=27, N=4, files_reserved=7:
+      remaining_for_agents = H-1 - chicsession - agent_title - files_reserved
+      overhead=3 (bug): 27-1-6-7=13, 4*3=12 <= 13 -> NOT compact
+      overhead=5 (fix): 27-1-8-7=11, 4*3=12 >  11 -> compact
+    """
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from claudechic.app import ChatApp
+
+    app = ChatApp()
+    # H=27: 2-line overhead difference crosses the compact threshold with files reserved
+    async with app.run_test(size=(120, 27)):
+        # Activate workflow engine (makes chicsession 5 lines: title+name+workflow+phase+actions)
+        app._workflow_engine = MagicMock()
+
+        # Control agent_section state precisely: exactly 4 agents, no worktrees
+        agent_section = app.agent_section
+        agent_section._agents.clear()
+        agent_section._worktrees.clear()
+        agent_section._compact = False
+        for i in range(4):
+            agent_section.add_agent(f"agent-{i}", f"Agent {i}")
+
+        # Add 5 files to FilesSection
+        section = app.files_section
+        for i in range(5):
+            section.add_file(Path(f"src/module_{i}.py"), additions=i + 1, deletions=0)
+
+        await app.workers.wait_for_complete()
+
+        # Trigger layout budget calculation
+        app._position_right_sidebar()
+        await app.workers.wait_for_complete()
+
+        # With the fix (overhead=5): agents must be in compact mode at H=20
+        # With the bug (overhead=3): agents stay expanded, content overflows, FilesSection clipped
+        assert agent_section._compact, (
+            "Agents must be compact at H=27 with workflow active + files reserved; "
+            "overhead=3 bug: remaining_for_agents=13, 4*3=12<=13 -> expanded; "
+            "overhead=5 fix: remaining_for_agents=11, 4*3=12>11 -> compact"
+        )
+
+
+@pytest.mark.asyncio
+async def test_files_section_renders_with_files():
+    """FilesSection renders file items with non-zero height inside a sidebar-like container.
+
+    Mirrors the real sidebar structure from screens/chat.py:
+        Vertical#right-sidebar (height: 100%)
+          ChicsessionLabel
+          AgentSection
+          PlanSection (hidden)
+          FilesSection (hidden -> becomes visible after mount_all_files)
+    """
+    from pathlib import Path
+
+    from claudechic.widgets import AgentSection, ChicsessionLabel, FilesSection, PlanSection
+    from textual.containers import Vertical
+
+    class SidebarLikeApp(App):
+        CSS = """
+        #right-sidebar {
+            width: 28;
+            height: 100%;
+        }
+        """
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="right-sidebar"):
+                yield ChicsessionLabel(id="chicsession-label")
+                yield AgentSection(id="agent-section")
+                yield PlanSection(id="plan-section", classes="hidden")
+                yield FilesSection(id="files-section", classes="hidden")
+
+    async with SidebarLikeApp().run_test(size=(130, 40)) as pilot:
+        app = pilot.app
+        agent_section = app.query_one("#agent-section", AgentSection)
+        agent_section.add_agent("agent-0", "MainAgent")
+
+        fs = app.query_one("#files-section", FilesSection)
+        files = {
+            Path("foo.py"): (10, 2, False),
+            Path("bar.md"): (5, 0, True),
+        }
+        fs.mount_all_files(files)
+        await pilot.pause()
+
+        assert fs.item_count == 2
+        assert not fs.has_class("hidden"), "FilesSection should not be hidden after mount_all_files"
+        scroll = fs.query_one("#files-scroll")
+        assert len(list(scroll.children)) == 2, (
+            f"Expected 2 children in #files-scroll, got {len(list(scroll.children))}"
+        )
+        assert scroll.region.height > 0, (
+            f"#files-scroll collapsed to height=0. "
+            f"scroll.region={scroll.region}, fs.region={fs.region}"
+        )
+        # FilesSection must be within the visible 40-line viewport — regression
+        # guard for #agent-scroll height:1fr bug that pushed FilesSection to y=43
+        assert fs.region.y < 40, (
+            f"FilesSection at y={fs.region.y} is off-screen (terminal height=40). "
+            f"AgentSection likely expanded to fill sidebar. "
+            f"Ensure #agent-scroll has height:auto, not height:1fr."
+        )

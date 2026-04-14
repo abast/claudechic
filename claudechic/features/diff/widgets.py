@@ -7,9 +7,10 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Label, Static, TextArea
+from textual.widgets import Label, Markdown, Static, TextArea
 
 from claudechic.widgets.content.diff import DiffWidget
+from claudechic.widgets.content.markdown_preview import MAX_PREVIEW_SIZE, PreviewToggle
 
 from .git import FileChange, Hunk, HunkComment
 
@@ -407,14 +408,25 @@ class FileDiffPanel(Vertical):
         margin-bottom: 2;
         height: auto;
     }
+    FileDiffPanel .md-preview {
+        height: auto;
+        padding: 1;
+    }
     """
 
-    def __init__(self, change: FileChange, **kwargs) -> None:
+    def __init__(self, change: FileChange, cwd: Path | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.change = change
+        self._cwd = cwd
+        self._is_md = change.path.endswith(".md")
+        self._preview_active = False
 
     def compose(self) -> ComposeResult:
         yield FileHeaderLabel(self.change.path, self.change.status)
+
+        # Add preview toggle for markdown files
+        if self._is_md:
+            yield PreviewToggle(self.change.path)
 
         # Show each hunk as a separate widget with separators between
         # Large hunks are split into smaller sub-hunks for easier navigation
@@ -434,6 +446,75 @@ class FileDiffPanel(Vertical):
         else:
             yield Label("[dim]Binary file or no diff available[/]")
 
+        # Hidden markdown preview (only for .md files)
+        if self._is_md:
+            md_widget = Markdown("", classes="md-preview")
+            md_widget.display = False
+            yield md_widget
+
+    def on_preview_toggle_toggled(self, event: PreviewToggle.Toggled) -> None:
+        """Handle preview toggle clicks."""
+        event.stop()
+        if event.show_preview:
+            self._show_preview()
+        else:
+            self._show_hunks()
+
+    def _show_preview(self) -> None:
+        """Show markdown preview, hide hunks.
+
+        Reads the current file from disk (not the diff) so the preview reflects
+        the working-tree state. Requires cwd to resolve the path; if cwd is not
+        set the method is a no-op (toggle click is silently ignored).
+        """
+        # cwd is required to resolve the file path. If DiffScreen did not pass
+        # cwd down through DiffView, this is None and we cannot read the file.
+        if not self._cwd:
+            return
+        full_path = self._cwd / self.change.path
+        try:
+            if full_path.stat().st_size > MAX_PREVIEW_SIZE:
+                self.app.notify(
+                    "File too large for preview (> 50KB)", severity="warning"
+                )
+                # Reset the toggle back to [Preview] state.
+                # Use r"\[Preview]" -- bare "[Preview]" is consumed as a Rich
+                # markup tag and renders as empty string.
+                toggle = self.query_one(PreviewToggle)
+                toggle._preview_active = False
+                toggle.update(r"\[Preview]")
+                return
+            content = full_path.read_text(encoding="utf-8")
+        except (FileNotFoundError, UnicodeDecodeError):
+            self.app.notify("Cannot preview file", severity="warning")
+            toggle = self.query_one(PreviewToggle)
+            toggle._preview_active = False
+            toggle.update(r"\[Preview]")
+            return
+
+        # Hide hunks and separators
+        for hunk in self.query(HunkWidget):
+            hunk.display = False
+        for sep in self.query(HunkSeparator):
+            sep.display = False
+
+        # Show markdown preview
+        md_widget = self.query_one(".md-preview", Markdown)
+        md_widget.update(content)
+        md_widget.display = True
+        self._preview_active = True
+
+    def _show_hunks(self) -> None:
+        """Show hunks, hide markdown preview."""
+        for hunk in self.query(HunkWidget):
+            hunk.display = True
+        for sep in self.query(HunkSeparator):
+            sep.display = True
+
+        md_widget = self.query_one(".md-preview", Markdown)
+        md_widget.display = False
+        self._preview_active = False
+
 
 class DiffView(VerticalScroll):
     """Main scrollable container of file diff panels with hunk navigation."""
@@ -444,9 +525,12 @@ class DiffView(VerticalScroll):
     }
     """
 
-    def __init__(self, changes: list[FileChange], **kwargs) -> None:
+    def __init__(
+        self, changes: list[FileChange], cwd: Path | None = None, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self.changes = changes
+        self._cwd = cwd
         # Build flat list of (file_idx, widget_idx) for navigation
         # Must account for large hunks being split into sub-hunks
         self._hunk_list: list[tuple[int, int]] = []
@@ -469,7 +553,9 @@ class DiffView(VerticalScroll):
             return
 
         for change in self.changes:
-            yield FileDiffPanel(change, id=f"panel-{_sanitize_id(change.path)}")
+            yield FileDiffPanel(
+                change, cwd=self._cwd, id=f"panel-{_sanitize_id(change.path)}"
+            )
 
     def on_mount(self) -> None:
         """Focus the first hunk on mount."""

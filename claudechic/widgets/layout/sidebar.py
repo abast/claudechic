@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.containers import Horizontal, VerticalScroll
 from textual.events import Click
 from textual.message import Message
 from textual.reactive import reactive
@@ -242,6 +243,35 @@ class FileItem(SidebarItem):
         self.post_message(self.Selected(self.file_path))
 
 
+class DiffButton(Static):
+    """Clickable button that triggers the DiffScreen."""
+
+    can_focus = False
+
+    DEFAULT_CSS = """
+    DiffButton {
+        width: auto;
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    DiffButton:hover {
+        color: $primary;
+        background: $panel;
+    }
+    """
+
+    class DiffRequested(Message):
+        """Posted when the diff button is clicked."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("/diff", id="diff-btn", **kwargs)
+
+    def on_click(self, event) -> None:
+        event.stop()
+        self.post_message(self.DiffRequested())
+
+
 class FilesSection(SidebarSection):
     """Sidebar section for edited files."""
 
@@ -249,12 +279,53 @@ class FilesSection(SidebarSection):
     FilesSection {
         border-top: solid $panel;
     }
+    FilesSection #files-scroll {
+        /* height: auto — NOT the Textual default 1fr.
+           Same reason as AgentSection #agent-scroll: 1fr would expand the
+           scroll container to fill whatever space FilesSection is allocated,
+           but since FilesSection itself has height: auto, the 1fr child
+           gets undefined space and can collapse to 0. auto sizes correctly
+           to the mounted FileItem children (each height: 3 or 1 compact).
+           max-height is set dynamically by _layout_sidebar_contents() based
+           on remaining sidebar space after agents and other sections. */
+        height: auto;
+    }
+    FilesSection .files-header {
+        height: auto;
+        width: 100%;
+    }
+    FilesSection .files-header .section-title {
+        width: 1fr;
+        padding: 1 0 0 1;
+    }
+    FilesSection .files-header DiffButton {
+        /* height: auto overrides DiffButton's default height: 1.
+           With height: 1 and padding-top: 1, the text is pushed below the
+           widget boundary and becomes invisible. height: auto lets the
+           button grow to content + padding, making the label visible. */
+        width: auto;
+        height: auto;
+        padding: 1 1 0 0;
+    }
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__("Files", *args, **kwargs)
         self._files: dict[Path, FileItem] = {}  # path -> item
         self._compact = False
+        self._scroll: VerticalScroll | None = None
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="files-header"):
+            yield Static(self._title, classes="section-title")
+            yield DiffButton()
+        yield VerticalScroll(id="files-scroll")
+
+    def _get_scroll(self) -> VerticalScroll:
+        """Return the scroll container, caching the reference."""
+        if self._scroll is None:
+            self._scroll = self.query_one("#files-scroll", VerticalScroll)
+        return self._scroll
 
     @property
     def item_count(self) -> int:
@@ -289,7 +360,7 @@ class FilesSection(SidebarSection):
         else:
             item = self._make_file_item(file_path, additions, deletions)
             self._files[file_path] = item
-            self.mount(item)
+            self._get_scroll().mount(item)
         if self._files:
             self.remove_class("hidden")
 
@@ -302,7 +373,7 @@ class FilesSection(SidebarSection):
                 self._files[file_path] = item
                 items.append(item)
         if items:
-            self.mount(*items)
+            self._get_scroll().mount(*items)
             self.remove_class("hidden")
 
     def clear(self) -> None:
@@ -481,6 +552,92 @@ class AgentItem(SidebarItem):
             self.post_message(self.Selected(self.agent_id))
 
 
+class ActionButton(Static):
+    """A clickable action button that does not steal focus."""
+
+    can_focus = False
+
+    DEFAULT_CSS = """
+    ActionButton {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+        color: $text-muted;
+    }
+    ActionButton:hover {
+        background: $accent;
+        color: white;
+    }
+    ActionButton.hidden {
+        display: none;
+    }
+    """
+
+    def __init__(self, label: str, id: str | None = None) -> None:
+        super().__init__(label, id=id)
+
+
+class ChicsessionActions(Widget):
+    """Adaptive action buttons for chicsession/workflow control.
+
+    Shows [Workflows] [Restore] when idle, [Stop] when a workflow is active.
+    """
+
+    class WorkflowPickerRequested(Message):
+        """Posted when the Workflows button is clicked."""
+
+    class RestoreRequested(Message):
+        """Posted when the Restore button is clicked."""
+
+    class StopRequested(Message):
+        """Posted when the Stop button is clicked."""
+
+    DEFAULT_CSS = """
+    ChicsessionActions {
+        layout: horizontal;
+        height: auto;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self._workflow_active = False
+
+    def compose(self) -> ComposeResult:
+        # Mount all buttons upfront; toggle visibility instead of mount/remove
+        # to avoid Textual deadlocks when called from reactive watchers.
+        yield ActionButton("Workflows", id="workflows-btn")
+        yield ActionButton("Restore", id="restore-btn")
+        stop = ActionButton("Stop", id="stop-btn")
+        stop.add_class("hidden")
+        yield stop
+
+    def update_state(self, workflow_active: bool) -> None:
+        """Toggle button visibility based on workflow state."""
+        if workflow_active == self._workflow_active:
+            return
+        self._workflow_active = workflow_active
+        for btn_id in ("workflows-btn", "restore-btn"):
+            if btn := self.query_one_optional(f"#{btn_id}", ActionButton):
+                btn.set_class(workflow_active, "hidden")
+        if btn := self.query_one_optional("#stop-btn", ActionButton):
+            btn.set_class(not workflow_active, "hidden")
+
+    def on_click(self, event: Click) -> None:
+        """Route clicks to the appropriate message."""
+        widget = event.widget
+        if not isinstance(widget, ActionButton):
+            return
+        btn_id = widget.id
+        if btn_id == "workflows-btn":
+            self.post_message(self.WorkflowPickerRequested())
+        elif btn_id == "restore-btn":
+            self.post_message(self.RestoreRequested())
+        elif btn_id == "stop-btn":
+            self.post_message(self.StopRequested())
+
+
 class ChicsessionLabel(Widget):
     """Shows the active chicsession name, workflow, and phase in the sidebar."""
 
@@ -520,6 +677,7 @@ class ChicsessionLabel(Widget):
         yield Static("", classes="chicsession-value")
         yield Static("", classes="chicsession-workflow")
         yield Static("", classes="chicsession-phase")
+        yield ChicsessionActions(id="chicsession-actions")
 
     def watch_name_text(self, value: str) -> None:
         """Update the displayed session name."""
@@ -533,7 +691,7 @@ class ChicsessionLabel(Widget):
                 label.add_class("chicsession-hint")
 
     def watch_workflow_text(self, value: str) -> None:
-        """Update the displayed workflow name."""
+        """Update the displayed workflow name and action buttons."""
         label = self.query_one_optional(".chicsession-workflow", Static)
         if label:
             if value:
@@ -542,6 +700,10 @@ class ChicsessionLabel(Widget):
             else:
                 label.update(Text(""))
                 label.display = False
+        # Update action buttons state
+        actions = self.query_one_optional("#chicsession-actions", ChicsessionActions)
+        if actions:
+            actions.update_state(bool(value))
 
     def watch_phase_text(self, value: str) -> None:
         """Update the displayed phase name."""
@@ -564,16 +726,48 @@ class ChicsessionLabel(Widget):
 class AgentSection(SidebarSection):
     """Sidebar section showing all agents with status indicators."""
 
+    COMPACT_THRESHOLD = 6
+
+    DEFAULT_CSS = """
+    AgentSection #agent-scroll {
+        /* height: auto — NOT the Textual default 1fr.
+           VerticalScroll defaults to height: 1fr, which fills ALL remaining
+           space in the parent Vertical container. Inside the right sidebar
+           (height: 100%), this causes AgentSection to consume the entire
+           sidebar height, pushing FilesSection and lower siblings off-screen.
+           height: auto makes AgentSection size to its actual agent items
+           so later siblings remain visible. */
+        height: auto;
+    }
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__("Agents", *args, **kwargs)
         self._agents: dict[str, AgentItem] = {}
         self._worktrees: dict[str, WorktreeItem] = {}  # branch -> item
         self._compact = False
+        self._scroll: VerticalScroll | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._title, classes="section-title")
+        yield VerticalScroll(id="agent-scroll")
 
     @property
     def item_count(self) -> int:
         """Total number of items (agents + worktrees)."""
         return len(self._agents) + len(self._worktrees)
+
+    def _get_scroll(self) -> VerticalScroll:
+        """Return the scroll container, caching the reference."""
+        if self._scroll is None:
+            self._scroll = self.query_one("#agent-scroll", VerticalScroll)
+        return self._scroll
+
+    def _check_compact(self) -> None:
+        """Auto-enable compact mode when agent count exceeds threshold."""
+        should_compact = len(self._agents) > self.COMPACT_THRESHOLD
+        if should_compact != self._compact:
+            self.set_compact(should_compact)
 
     def set_compact(self, compact: bool) -> None:
         """Set compact mode for all items."""
@@ -601,19 +795,24 @@ class AgentSection(SidebarSection):
         # Apply current compact mode to new item
         item.set_class(self._compact, "compact")
         self._agents[agent_id] = item
-        self.mount(item)
+        self._get_scroll().mount(item)
+        self._check_compact()
 
     def remove_agent(self, agent_id: str) -> None:
         """Remove an agent from the sidebar."""
         if agent_id in self._agents:
             self._agents[agent_id].remove()
             del self._agents[agent_id]
+            self._check_compact()
 
     def set_active(self, agent_id: str) -> None:
         """Mark an agent as active (selected)."""
         # Use update=False to defer CSS recalculation (caller will refresh)
         for aid, item in self._agents.items():
             item.set_class(aid == agent_id, "active", update=False)
+        # Auto-scroll active agent into view
+        if agent_id in self._agents:
+            self._agents[agent_id].scroll_visible()
 
     def update_status(self, agent_id: str, status: AgentStatus) -> None:
         """Update an agent's status."""
@@ -635,7 +834,7 @@ class AgentSection(SidebarSection):
         # Apply current compact mode to new item
         item.set_class(self._compact, "compact")
         self._worktrees[branch] = item
-        self.mount(item)
+        self._get_scroll().mount(item)
 
     def remove_worktree(self, branch: str) -> None:
         """Remove a ghost worktree from the sidebar."""

@@ -24,6 +24,53 @@ class DiagnosticsLabel(ClickableLabel):
         self.post_message(self.Requested())
 
 
+class ComputerInfoLabel(ClickableLabel):
+    """Clickable 'sys' label that opens ComputerInfoModal."""
+
+    class Requested(Message):
+        """Emitted when user clicks to open computer info."""
+
+    def on_click(self, event) -> None:
+        self.post_message(self.Requested())
+
+
+class AgentLabel(ClickableLabel):
+    """Clickable agent name label in the footer.
+
+    Shows the active agent name (truncated to 12 chars). Hidden when
+    only one agent is active. Clicking opens the AgentSwitcher modal.
+    """
+
+    can_focus = False
+
+    class SwitcherRequested(Message):
+        """Emitted when user clicks to open the agent switcher."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._display_name: str = ""
+
+    @property
+    def renderable(self) -> str:
+        """Return the current display text."""
+        return self._display_name
+
+    def on_click(self, event) -> None:
+        self.post_message(self.SwitcherRequested())
+
+    def update_agent(self, name: str, visible: bool) -> None:
+        """Update the displayed agent name and visibility.
+
+        Args:
+            name: Active agent name (truncated to 12 chars for display).
+            visible: Whether to show the label (False when single agent).
+        """
+        display_name = name[:12] if len(name) > 12 else name
+        self._display_name = display_name
+        self.update(display_name)
+        self.set_class(not visible, "hidden")
+
+
 class PermissionModeLabel(ClickableLabel):
     """Clickable permission mode status label."""
 
@@ -129,8 +176,13 @@ class StatusFooter(Static):
             yield DiagnosticsLabel(
                 "session_info", id="diagnostics-label", classes="footer-label"
             )
+            yield Static("·", classes="footer-sep")
+            yield ComputerInfoLabel(
+                "sys", id="computer-info-label", classes="footer-label"
+            )
             yield Static("", id="footer-spacer")
             yield ProcessIndicator(id="process-indicator", classes="hidden")
+            yield AgentLabel("", id="agent-label", classes="footer-label hidden")
             yield ContextBar(id="context-bar")
             yield CPUBar(id="cpu-bar")
             yield Static("", id="branch-label", classes="footer-label")
@@ -180,6 +232,11 @@ class StatusFooter(Static):
         """Update the process indicator."""
         if indicator := self.query_one_optional("#process-indicator", ProcessIndicator):
             indicator.update_processes(processes)
+
+    def update_agent_label(self, name: str, visible: bool) -> None:
+        """Update the agent label in the footer."""
+        if label := self.query_one_optional("#agent-label", AgentLabel):
+            label.update_agent(name, visible)
 
     def update_vi_mode(self, mode: ViMode | None, enabled: bool = True) -> None:
         """Update the vi-mode indicator."""

@@ -269,6 +269,9 @@ async def _handle_restore(app: ChatApp, name: str) -> None:
     if cs.workflow_state:
         app._restore_workflow_from_session()
 
+    # Update sidebar with workflow/phase info (Issue #9)
+    app._update_sidebar_workflow_info()
+
     msg = f"Chicsession '{name}' restored — {restored} agent(s)"
     if failed:
         msg += f", {failed} failed"
