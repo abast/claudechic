@@ -1400,9 +1400,19 @@ class ChatApp(App):
 
             self._token_store = OverrideTokenStore()
             self._hit_logger = HitLogger(self._cwd / ".claude" / "hits.jsonl")
+
+            # Look for project-level overrides first, fall back to bundled defaults
+            _defaults = Path(__file__).parent / "defaults"
+            _global_dir = self._cwd / "global"
+            if not _global_dir.is_dir():
+                _global_dir = _defaults / "global"
+            _workflows_dir = self._cwd / "workflows"
+            if not _workflows_dir.is_dir():
+                _workflows_dir = _defaults / "workflows"
+
             self._manifest_loader = ManifestLoader(
-                global_dir=self._cwd / "global",
-                workflows_dir=self._cwd / "workflows",
+                global_dir=_global_dir,
+                workflows_dir=_workflows_dir,
             )
             # Register all built-in section parsers before first load()
             from claudechic.workflows import register_default_parsers
