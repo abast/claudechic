@@ -250,6 +250,7 @@ class ChatApp(App):
         self._load_result: Any = None  # LoadResult
         self._workflow_registry: dict[str, Path] = {}  # workflow_id -> directory
         self._workflow_engine: Any = None  # WorkflowEngine
+        self._resolved_workflows_dir: Path | None = None  # Set in _init_workflow_infrastructure
 
         # Toast debounce state: toast_key -> last-shown monotonic timestamp
         self._toast_timestamps: dict[str, float] = {}
@@ -882,7 +883,7 @@ class ChatApp(App):
             compact_hooks = create_post_compact_hook(
                 engine=self._workflow_engine,
                 agent_role=agent_type or "",
-                workflows_dir=self._cwd / "workflows",
+                workflows_dir=self._resolved_workflows_dir or self._cwd / "workflows",
             )
             for event, matchers in compact_hooks.items():
                 hooks.setdefault(event, []).extend(matchers)
@@ -1410,6 +1411,8 @@ class ChatApp(App):
             if not _workflows_dir.is_dir():
                 _workflows_dir = _defaults / "workflows"
 
+            self._resolved_workflows_dir = _workflows_dir
+
             self._manifest_loader = ManifestLoader(
                 global_dir=_global_dir,
                 workflows_dir=_workflows_dir,
@@ -1750,7 +1753,7 @@ class ChatApp(App):
             from claudechic.workflows.agent_folders import assemble_phase_prompt
 
             prompt = assemble_phase_prompt(
-                workflows_dir=Path.cwd() / "workflows",
+                workflows_dir=getattr(self, "_resolved_workflows_dir", Path.cwd() / "workflows"),
                 workflow_id=workflow_id,
                 role_name=main_role,
                 current_phase=current_phase,
