@@ -35,7 +35,7 @@ async def test_app_mounts_basic_widgets(mock_sdk):
 
 @pytest.mark.asyncio
 async def test_permission_mode_cycle(mock_sdk):
-    """Shift+Tab cycles permission mode: default -> bypassPermissions -> acceptEdits -> plan -> default.
+    """Shift+Tab cycles permission mode: default -> bypassPermissions -> auto -> acceptEdits -> plan -> default.
 
     Note: Initial mode is 'default' (fresh install behavior).
     Cycle goes through all modes and wraps back to default.
@@ -50,7 +50,11 @@ async def test_permission_mode_cycle(mock_sdk):
         await pilot.press("shift+tab")
         assert app._agent.permission_mode == "bypassPermissions"
 
-        # Cycle: bypassPermissions -> acceptEdits
+        # Cycle: bypassPermissions -> auto
+        await pilot.press("shift+tab")
+        assert app._agent.permission_mode == "auto"
+
+        # Cycle: auto -> acceptEdits
         await pilot.press("shift+tab")
         assert app._agent.permission_mode == "acceptEdits"
 
@@ -76,9 +80,9 @@ async def test_permission_mode_footer_updates(mock_sdk):
         await pilot.press("shift+tab")
         assert footer.permission_mode == "bypassPermissions"
 
-        # Second cycle: bypassPermissions -> acceptEdits
+        # Second cycle: bypassPermissions -> auto
         await pilot.press("shift+tab")
-        assert footer.permission_mode == "acceptEdits"
+        assert footer.permission_mode == "auto"
 
 
 @pytest.mark.asyncio
