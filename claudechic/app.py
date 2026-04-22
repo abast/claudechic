@@ -302,6 +302,8 @@ class ChatApp(App):
         self._hamburger_btn: HamburgerButton | None = None
         # Available models from SDK (populated in _update_slash_commands)
         self._available_models: list[dict] = []
+        # Fast mode: uses API key + fast-mode beta header for priority processing
+        self._fast_mode: bool = False
         # Track pending slash commands passed to Claude (for typo detection)
         # agent_id -> command name (e.g., "/cleanup")
         self._pending_slash_commands: dict[str, str] = {}
@@ -996,6 +998,7 @@ class ChatApp(App):
             permission_mode=permission_mode,
             env=env,
             setting_sources=["user", "project", "local"],
+            settings=str(self._FAST_MODE_SETTINGS) if self._fast_mode else None,
             cwd=cwd,
             resume=resume,
             model=model,
@@ -1004,8 +1007,62 @@ class ChatApp(App):
             stderr=self._handle_sdk_stderr,
             hooks=self._merged_hooks(agent_type=agent_type),
             enable_file_checkpointing=True,
-            extra_args={"replay-user-messages": None},
+            extra_args=self._build_extra_args(),
         )
+
+    # Static settings file shipped with the package; passed to the CLI via
+    # ``--settings`` when fast mode is active.
+    _FAST_MODE_SETTINGS = Path(__file__).parent / "fast_mode_settings.json"
+
+    def _build_extra_args(self) -> dict[str, str | None]:
+        """Build extra CLI args dict."""
+        return {"replay-user-messages": None}
+
+    async def _handle_fast_command(self, arg: str) -> None:
+        """Handle /fast [on|off] — toggle priority processing.
+
+        Fast mode passes a settings file with ``fastMode: true`` to the
+        CLI via the ``--settings`` flag.  The CLI then sends
+        ``speed: "fast"`` on API requests for Opus 4.6.
+        """
+        arg = arg.strip().lower()
+        if arg == "on":
+            if self._fast_mode:
+                self.notify("Fast mode is already on.")
+                return
+            self._fast_mode = True
+            self.notify("⚡ Fast mode: on (2.5× speed, extra cost)")
+            await self._reconnect_for_fast_mode()
+        elif arg == "off":
+            if not self._fast_mode:
+                self.notify("Fast mode is already off.")
+                return
+            self._fast_mode = False
+            self.notify("Fast mode: off")
+            await self._reconnect_for_fast_mode()
+        elif arg == "":
+            state = "on ⚡" if self._fast_mode else "off"
+            self.notify(f"Fast mode: {state}")
+        else:
+            self.notify("Usage: /fast on | /fast off", severity="error")
+
+    async def _reconnect_for_fast_mode(self) -> None:
+        """Reconnect the active agent so the CLI re-reads settings."""
+        agent = self._agent
+        if not agent or not agent.client:
+            return
+        try:
+            session_id = agent.session_id
+            await agent.disconnect()
+            options = self._make_options(
+                cwd=agent.cwd,
+                resume=session_id,
+                agent_name=agent.name,
+                model=agent.model,
+            )
+            await agent.connect(options, resume=session_id)
+        except Exception as e:
+            self.show_error("Fast mode reconnect failed", e)
 
     async def on_mount(self) -> None:
         # Track app start (and install if new user)

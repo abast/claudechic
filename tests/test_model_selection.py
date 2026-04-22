@@ -192,3 +192,24 @@ def test_context_window_plain_models_unchanged():
     assert get_context_window("claude-opus-4-6") == 1_000_000  # substring "opus"
     assert get_context_window("claude-sonnet-4-5") == 200_000  # substring "sonnet"
     assert get_context_window(None) == 200_000  # default
+
+
+# ── Fast mode (temp settings file) ────────────────────────────────────────
+
+
+def test_build_extra_args_always_has_replay():
+    """Extra args always include replay-user-messages."""
+    app = ChatApp.__new__(ChatApp)
+    app._fast_mode = False
+    assert app._build_extra_args() == {"replay-user-messages": None}
+
+    app._fast_mode = True
+    assert app._build_extra_args() == {"replay-user-messages": None}
+
+
+def test_fast_mode_settings_file_contains_fast_mode():
+    """The static settings file shipped with the package has fastMode: true."""
+    import json
+
+    data = json.loads(ChatApp._FAST_MODE_SETTINGS.read_text())
+    assert data["fastMode"] is True
