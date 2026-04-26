@@ -45,6 +45,14 @@ claudechic/
 │       ├── __init__.py   # Public API (list_worktrees, handle_worktree_command)
 │       ├── commands.py   # /worktree command handlers
 │       └── git.py        # Git worktree operations
+├── guardrails/        # Rule enforcement pipeline (PreToolUse hooks)
+│   ├── __init__.py    # Package marker
+│   ├── digest.py      # Per-agent rule digest (active/skipped status)
+│   ├── hits.py        # Append-only JSONL audit trail (.claudechic/hits.jsonl)
+│   ├── hooks.py       # SDK hook closures — two-step evaluate (inject then enforce)
+│   ├── parsers.py     # RulesParser, InjectionsParser for manifest YAML
+│   ├── rules.py       # Rule/Injection dataclasses, matching, role/phase filtering
+│   └── tokens.py      # OverrideTokenStore — one-time override/ack tokens
 ├── hints/             # Hints pipeline (LEAF: stdlib only, no upward imports)
 │   ├── __init__.py    # Package marker
 │   ├── engine.py      # 6-stage hint evaluation pipeline
@@ -95,9 +103,9 @@ claudechic/
         ├── profile.py       # ProfileModal - profiling stats
         ├── process_modal.py # ProcessModal - process list
         ├── process_detail.py # ProcessDetailModal - single process detail, kill, metrics
-        ├── computer_info.py # ComputerInfoModal - host, OS, Python, SDK, CWD (sys button)
-        ├── agent_switcher.py # AgentSwitcher - Ctrl+G modal to search and switch agents
-        └── diagnostics.py   # DiagnosticsModal - session JSONL path, compaction summary
+        ├── computer_info.py # ComputerInfoModal - system info + session diagnostics (info button)
+        ├── guardrails.py    # GuardrailsModal - rule/injection list with toggle checkboxes
+        └── agent_switcher.py # AgentSwitcher - Ctrl+G modal to search and switch agents
 
 tests/
 ├── __init__.py        # Package marker
