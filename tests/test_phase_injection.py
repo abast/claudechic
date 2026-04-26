@@ -876,10 +876,11 @@ async def test_main_agent_role_resolves_to_main_role(
         ],
         "rules": [
             {
-                "id": "prefer_ask_agent",
-                "trigger": "PreToolUse/mcp__chic__tell_agent",
+                "id": "coord_no_direct_tests",
+                "trigger": "PreToolUse/Bash",
                 "level": "warn",
-                "message": "Coordinator should use ask_agent, not tell_agent.",
+                "detect": {"pattern": "pytest"},
+                "message": "Coordinator should delegate testing, not run pytest directly.",
                 "roles": ["coordinator"],
             }
         ],
@@ -929,7 +930,7 @@ async def test_main_agent_role_resolves_to_main_role(
 
             async def fire_coord_rule() -> bool:
                 """Run PreToolUse hooks bound to main_agent; return True
-                if any rule blocked the tell_agent call."""
+                if any rule blocked the Bash call."""
                 hooks = app._merged_hooks(agent=main_agent)
                 if "PreToolUse" not in hooks or not hooks["PreToolUse"]:
                     return False
@@ -937,8 +938,8 @@ async def test_main_agent_role_resolves_to_main_role(
                     for hook_fn in matcher.hooks:
                         result = await hook_fn(
                             {
-                                "tool_name": "mcp__chic__tell_agent",
-                                "tool_input": {"name": "X", "message": "test"},
+                                "tool_name": "Bash",
+                                "tool_input": {"command": "pytest tests/"},
                             },
                             None,
                             None,
