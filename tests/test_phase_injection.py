@@ -119,12 +119,19 @@ def test_agent_accepts_agent_type_kwarg(tmp_path: Path) -> None:
     assert agent.agent_type == "skeptic"
 
 
-def test_agent_type_defaults_to_none(tmp_path: Path) -> None:
-    """Agent() without agent_type must have agent_type attribute set to None."""
+def test_agent_type_defaults_to_default_sentinel(tmp_path: Path) -> None:
+    """Agent() without agent_type must default to the DEFAULT_ROLE sentinel.
+
+    This makes "no workflow-specific role" explicit: the agent carries
+    'default' rather than None, so role-scoped rules (e.g. roles:
+    [coordinator]) reliably skip it. Workflow activation promotes the
+    main agent out of 'default' into the workflow's main_role.
+    """
     from claudechic.agent import Agent
+    from claudechic.workflows.agent_folders import DEFAULT_ROLE
 
     agent = Agent(name="TestAgent", cwd=tmp_path)
-    assert agent.agent_type is None
+    assert agent.agent_type == DEFAULT_ROLE
 
 
 async def test_agent_manager_passes_agent_type_to_agent(
@@ -789,9 +796,9 @@ async def test_close_leadership_rule_fires_on_coordinator(tmp_path: Path) -> Non
     from claudechic.workflows.loader import ManifestLoader
 
     # Load from the REAL repo manifests — rule must exist in production YAML
-    repo_root = Path(__file__).resolve().parents[3]
-    global_dir = repo_root / "global"
-    workflows_dir = repo_root / "workflows"
+    repo_root = Path(__file__).resolve().parents[1]
+    global_dir = repo_root / "claudechic" / "defaults" / "global"
+    workflows_dir = repo_root / "claudechic" / "defaults" / "workflows"
 
     loader = ManifestLoader(global_dir=global_dir, workflows_dir=workflows_dir)
     register_default_parsers(loader)
@@ -831,25 +838,27 @@ async def test_close_leadership_rule_fires_on_coordinator(tmp_path: Path) -> Non
 
 
 # ===========================================================================
-# Test 13: main agent gets main_role for guardrail role filtering
+# Test 13: main agent is promoted to main_role on workflow activation
 #
 # BEHAVIORAL: Real ChatApp, real workflow activation, real guardrail hooks.
-# Bug: main agent connects BEFORE workflow activation, so its hooks have
-# agent_role=None. Rules with `roles: [coordinator]` skip it. After
-# activation, main agent must resolve to main_role from the manifest.
-# FAILS: main agent's agent_role is None after workflow activation.
+# Main agent starts with the DEFAULT_ROLE sentinel. Role-scoped rules
+# (e.g. `roles: [coordinator]`) must not fire before activation. On
+# _activate_workflow the main agent's agent_type flips to main_role,
+# and guardrail hooks — which read agent.agent_type dynamically — pick
+# it up on the next rule evaluation without a reconnect. On
+# _deactivate_workflow, the main agent reverts to DEFAULT_ROLE.
 # ===========================================================================
 
 
 async def test_main_agent_role_resolves_to_main_role(
     mock_sdk, tmp_path, monkeypatch
 ) -> None:
-    """After workflow activation, main agent guardrails must use main_role.
+    """Main agent role transitions: default → main_role → default.
 
-    The main agent connects before the workflow is activated, so its
-    guardrail hooks initially have agent_role=None. After activation,
-    the main agent IS the coordinator (per main_role in the manifest).
-    Rules with roles: [coordinator] must fire for the main agent.
+    Before activation, the main agent carries DEFAULT_ROLE and
+    coordinator-scoped rules must skip it. After _activate_workflow,
+    main agent.agent_type == main_role and those rules fire. After
+    _deactivate_workflow, it's back to DEFAULT_ROLE.
     """
     monkeypatch.chdir(tmp_path)
 
@@ -903,13 +912,30 @@ async def test_main_agent_role_resolves_to_main_role(
             app._discover_workflows()
             await pilot.pause()
 
-            # BEFORE activation: main agent hooks should NOT fire
-            # coordinator-only rules (no workflow active)
-            pre_hooks = app._merged_hooks(agent_type=None)
-            if "PreToolUse" in pre_hooks and pre_hooks["PreToolUse"]:
-                for matcher in pre_hooks["PreToolUse"]:
+            # Grab the main agent (created during app init) — guardrail
+            # hooks are bound to it and read agent.agent_type on every
+            # rule evaluation.
+            main_agent = app.agent_mgr.active
+            assert main_agent is not None, "No main agent after app init"
+
+            from claudechic.workflows.agent_folders import DEFAULT_ROLE
+
+            # Main agent starts as DEFAULT_ROLE — no workflow-specific
+            # role wiring, no coordinator rules apply.
+            assert main_agent.agent_type == DEFAULT_ROLE, (
+                f"Main agent should start as '{DEFAULT_ROLE}', got "
+                f"{main_agent.agent_type!r}"
+            )
+
+            async def fire_coord_rule() -> bool:
+                """Run PreToolUse hooks bound to main_agent; return True
+                if any rule blocked the tell_agent call."""
+                hooks = app._merged_hooks(agent=main_agent)
+                if "PreToolUse" not in hooks or not hooks["PreToolUse"]:
+                    return False
+                for matcher in hooks["PreToolUse"]:
                     for hook_fn in matcher.hooks:
-                        pre_result = await hook_fn(
+                        result = await hook_fn(
                             {
                                 "tool_name": "mcp__chic__tell_agent",
                                 "tool_input": {"name": "X", "message": "test"},
@@ -917,43 +943,41 @@ async def test_main_agent_role_resolves_to_main_role(
                             None,
                             None,
                         )
-                        assert pre_result.get("decision") != "block", (
-                            "Rule fired BEFORE workflow activation -- false positive"
-                        )
+                        if result.get("decision") == "block":
+                            return True
+                return False
+
+            # BEFORE activation: main agent is DEFAULT_ROLE → coord rule skips it
+            assert not await fire_coord_rule(), (
+                "Coordinator-scoped rule fired for DEFAULT_ROLE main agent"
+            )
 
             # Activate workflow
             await app._activate_workflow("test-workflow")
             await pilot.pause()
 
-            # AFTER activation: main agent's hooks must resolve its role
-            # to "coordinator" (from main_role in manifest) and fire the
-            # coordinator-only rule
-            post_hooks = app._merged_hooks(agent_type=None)
-            assert "PreToolUse" in post_hooks, (
-                "No PreToolUse hooks after workflow activation"
+            # AFTER activation: main agent is promoted to main_role,
+            # and the same hooks (same Agent ref, read dynamically) now
+            # see the new role.
+            assert main_agent.agent_type == "coordinator", (
+                f"Main agent should be promoted to 'coordinator' on "
+                f"activation, got {main_agent.agent_type!r}"
+            )
+            assert await fire_coord_rule(), (
+                "Rule with roles: [coordinator] did NOT fire for main agent "
+                "after workflow activation (main_agent.agent_type = "
+                f"{main_agent.agent_type!r})."
             )
 
-            fired = False
-            for matcher in post_hooks["PreToolUse"]:
-                for hook_fn in matcher.hooks:
-                    post_result = await hook_fn(
-                        {
-                            "tool_name": "mcp__chic__tell_agent",
-                            "tool_input": {"name": "Skeptic", "message": "test"},
-                        },
-                        None,
-                        None,
-                    )
-                    if post_result.get("decision") == "block":
-                        fired = True
-                        break
-
-            assert fired, (
-                "Rule with roles: [coordinator] did NOT fire for the main agent "
-                "after workflow activation. The main agent's guardrail hooks must "
-                "resolve agent_role to the workflow's main_role ('coordinator'). "
-                "Currently agent_role is None because the agent connected before "
-                "the workflow was activated."
+            # DEACTIVATE: role reverts to DEFAULT_ROLE and the rule stops firing
+            app._deactivate_workflow()
+            await pilot.pause()
+            assert main_agent.agent_type == DEFAULT_ROLE, (
+                f"Main agent should revert to '{DEFAULT_ROLE}' on "
+                f"deactivation, got {main_agent.agent_type!r}"
+            )
+            assert not await fire_coord_rule(), (
+                "Coordinator-scoped rule still fired after workflow deactivation"
             )
 
 

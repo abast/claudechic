@@ -1396,6 +1396,8 @@ async def test_toast_debounce_suppresses_repeat(mock_sdk):
 
         import asyncio
 
+        from claudechic.widgets.prompts import SelectionPrompt
+
         # First prompt -- toast should fire (sets debounce timestamp)
         notif_count_before = len(app._notifications)
         prompt_task = asyncio.create_task(
@@ -1403,13 +1405,15 @@ async def test_toast_debounce_suppresses_repeat(mock_sdk):
                 "global:no_pip_install", "Block?", agent=second_agent
             )
         )
-        await pilot.pause()
-        await pilot.pause()
+
+        # Wait for the SelectionPrompt to mount (robust under parallel)
+        for _ in range(20):
+            await pilot.pause()
+            if list(app.query(SelectionPrompt)):
+                break
 
         notifs_first = list(app._notifications)[notif_count_before:]
         assert len(notifs_first) > 0, "Expected toast on first prompt"
-
-        from claudechic.widgets.prompts import SelectionPrompt
 
         prompts = list(app.query(SelectionPrompt))
         assert len(prompts) >= 1

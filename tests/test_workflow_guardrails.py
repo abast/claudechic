@@ -64,7 +64,7 @@ class TestGuardrailRules:
             }
         ]
         loader = _setup_rules(tmp_path, rules)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
         token_store = OverrideTokenStore()
 
         try:
@@ -83,7 +83,7 @@ class TestGuardrailRules:
 
             # Verify hit logged
             lines = (
-                (tmp_path / ".claude" / "hits.jsonl").read_text().strip().split("\n")
+                (tmp_path / ".claudechic" / "hits.jsonl").read_text().strip().split("\n")
             )
             assert len(lines) >= 1
             record = json.loads(lines[0])
@@ -105,7 +105,7 @@ class TestGuardrailRules:
             }
         ]
         loader = _setup_rules(tmp_path, rules)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
         token_store = OverrideTokenStore()
 
         try:
@@ -151,7 +151,7 @@ class TestGuardrailRules:
 
         loader = ManifestLoader(global_dir, wf_dir.parent)
         register_default_parsers(loader)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
         token_store = OverrideTokenStore()
 
         try:
@@ -197,7 +197,7 @@ class TestGuardrailRules:
             }
         ]
         loader = _setup_rules(tmp_path, rules=[], injections=injections)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
         token_store = OverrideTokenStore()
 
         try:
@@ -241,7 +241,7 @@ class TestGuardrailRules:
             }
         ]
         loader = _setup_rules(tmp_path, rules)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
 
         try:
             hooks = create_guardrail_hooks(loader=loader, hit_logger=hit_logger)
@@ -267,7 +267,7 @@ class TestGuardrailRules:
 
         loader = ManifestLoader(global_dir, wf_dir)
         register_default_parsers(loader)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
 
         try:
             # Patch _discover to raise OSError (simulates unreadable dir)
@@ -305,7 +305,7 @@ class TestRoleGatedRules:
             }
         ]
         loader = _setup_rules(tmp_path, rules)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
         token_store = OverrideTokenStore()
 
         try:
@@ -348,7 +348,7 @@ class TestRoleGatedRules:
             }
         ]
         loader = _setup_rules(tmp_path, rules)
-        hit_logger = HitLogger(tmp_path / ".claude" / "hits.jsonl")
+        hit_logger = HitLogger(tmp_path / ".claudechic" / "hits.jsonl")
         token_store = OverrideTokenStore()
 
         try:

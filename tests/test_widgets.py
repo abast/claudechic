@@ -968,32 +968,32 @@ async def test_sidebar_handles_many_agents_without_overflow():
             )
 
 
-# --- ComputerInfoLabel + ComputerInfoModal tests ---
+# --- InfoLabel + ComputerInfoModal tests ---
 
 
 @pytest.mark.asyncio
-async def test_sys_label_click_opens_computer_info_modal():
-    """Click #computer-info-label opens ComputerInfoModal with system info sections."""
-    from claudechic.widgets.layout.footer import ComputerInfoLabel
+async def test_info_label_click_opens_info_modal():
+    """Click #info-label opens ComputerInfoModal with system + session sections."""
+    from claudechic.widgets.layout.footer import InfoLabel
     from claudechic.widgets.modals.computer_info import ComputerInfoModal
 
-    class SysTestApp(App):
+    class InfoTestApp(App):
         def compose(self) -> ComposeResult:
             yield StatusFooter()
 
-        def on_computer_info_label_requested(
-            self, event: ComputerInfoLabel.Requested
+        def on_info_label_requested(
+            self, event: InfoLabel.Requested
         ) -> None:
             self.push_screen(ComputerInfoModal(cwd="/tmp"))
 
-    app = SysTestApp()
+    app = InfoTestApp()
     async with app.run_test(size=(80, 24)) as pilot:
         # Verify label exists
-        label = app.query_one("#computer-info-label", ComputerInfoLabel)
+        label = app.query_one("#info-label", InfoLabel)
         assert label is not None
 
         # Post the message (simulates a click on the label)
-        label.post_message(ComputerInfoLabel.Requested())
+        label.post_message(InfoLabel.Requested())
         await pilot.pause()
 
         # Assert ComputerInfoModal is on the screen stack
