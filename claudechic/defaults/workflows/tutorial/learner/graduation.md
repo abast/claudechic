@@ -7,7 +7,7 @@ Congratulations! You've experienced:
 - Phase-scoped rules
 - Injections that modify tool input
 - Hints with different lifecycles
-- Hit logging to `.claude/hits.jsonl`
+- Hit logging to `.claudechic/hits.jsonl`
 - Global rules vs workflow-scoped rules
 
 Run `/tutorial stop` to deactivate the tutorial workflow.

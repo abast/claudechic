@@ -11,10 +11,10 @@ phases:
     file: setup
     advance_checks:
       - type: command-output-check
-        command: "ls .project_team/*/STATUS.md 2>/dev/null"
+        command: "ls $STATE_DIR/STATUS.md 2>/dev/null"
         pattern: "STATUS\\.md"
       - type: command-output-check
-        command: "ls .project_team/*/userprompt.md 2>/dev/null"
+        command: "ls $STATE_DIR/userprompt.md 2>/dev/null"
         pattern: "userprompt\\.md"
   - id: leadership
     file: leadership
@@ -22,7 +22,7 @@ phases:
     file: specification
     advance_checks:
       - type: command-output-check
-        command: "ls .project_team/*/specification/SPECIFICATION.md 2>/dev/null"
+        command: "ls $STATE_DIR/specification/SPECIFICATION.md 2>/dev/null"
         pattern: "SPECIFICATION\\.md"
       - type: manual-confirm
         prompt: "Specification approved by user?"

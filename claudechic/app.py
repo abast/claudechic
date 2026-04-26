@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from claude_agent_sdk.types import HookEvent
     from textual.timer import Timer
 
+    from claudechic.guardrails.hooks import GetRoleCallback
     from claudechic.screens.chat import ChatScreen
 
 from claude_agent_sdk import (
@@ -111,8 +112,9 @@ from claudechic.widgets import (
 )
 from claudechic.widgets.layout.footer import (
     AgentLabel,
-    ComputerInfoLabel,
-    DiagnosticsLabel,
+    EffortLabel,
+    GuardrailsLabel,
+    InfoLabel,
     ModelLabel,
     PermissionModeLabel,
     StatusFooter,
@@ -314,10 +316,13 @@ class ChatApp(App):
         self._manifest_loader: Any = None  # ManifestLoader
         self._hit_logger: Any = None  # HitLogger
         self._token_store: Any = None  # OverrideTokenStore
+        self._disabled_rules: set[str] = set()  # User-toggled disabled rule IDs
         self._load_result: Any = None  # LoadResult
         self._workflow_registry: dict[str, Path] = {}  # workflow_id -> directory
         self._workflow_engine: Any = None  # WorkflowEngine
-        self._resolved_workflows_dir: Path | None = None  # Set in _init_workflow_infrastructure
+        self._resolved_workflows_dir: Path | None = (
+            None  # Set in _init_workflow_infrastructure
+        )
 
         # Toast debounce state: toast_key -> last-shown monotonic timestamp
         self._toast_timestamps: dict[str, float] = {}
@@ -725,29 +730,35 @@ class ChatApp(App):
         }
 
     def _guardrail_hooks(
-        self, agent_role: str | None = None
+        self,
+        agent: Agent | None = None,
+        agent_role: str | None = None,
     ) -> dict[HookEvent, list[HookMatcher]]:
         """Create PreToolUse hooks that evaluate rules from manifests.
 
         Delegates to create_guardrail_hooks() in guardrails/hooks.py.
         Two-step pipeline: injections first, then enforcement (log/warn/deny).
+
+        Role resolution: if an ``Agent`` is provided, the hooks read
+        ``agent.agent_type`` at rule-evaluation time — so mutating the
+        agent's role (e.g. on workflow activation) takes effect
+        immediately without reconnecting. If only ``agent_role`` is
+        provided (tests/legacy paths), the role is static.
         """
         if not self._manifest_loader or not self._hit_logger or not self._token_store:
             return {}
 
         from claudechic.guardrails.hooks import create_guardrail_hooks
 
-        # If an explicit role is given (sub-agents), use it statically.
-        # If no role (main agent), resolve dynamically: after workflow
-        # activation the main agent assumes the manifest's main_role.
-        if agent_role:
-            effective_role: str | None | callable = agent_role
+        effective_role: str | None | GetRoleCallback
+        if agent is not None:
+            # Dynamic: read the agent's mutable role on every evaluation.
+            # Workflow activation sets agent.agent_type = main_role for the
+            # main agent; deactivation restores "default". Sub-agents keep
+            # whatever role they were spawned with.
+            effective_role = lambda: agent.agent_type  # noqa: E731
         else:
-
-            def effective_role() -> str | None:
-                if self._workflow_engine:
-                    return getattr(self._workflow_engine.manifest, "main_role", None)
-                return None
+            effective_role = agent_role
 
         return create_guardrail_hooks(
             loader=self._manifest_loader,
@@ -762,6 +773,7 @@ class ChatApp(App):
                 self._workflow_engine.workflow_id if self._workflow_engine else None
             ),
             consume_override=self._token_store.consume,
+            get_disabled_rules=lambda: self._disabled_rules,
         )
 
     def _should_show_toast(self, toast_key: str | None) -> bool:
@@ -934,24 +946,35 @@ class ChatApp(App):
         return result == "allow"
 
     def _merged_hooks(
-        self, agent_type: str | None = None
+        self,
+        agent: Agent | None = None,
+        agent_type: str | None = None,
     ) -> dict[HookEvent, list[HookMatcher]]:
-        """Merge plan-mode hooks, guardrail hooks, and PostCompact hook."""
+        """Merge plan-mode hooks, guardrail hooks, and PostCompact hook.
+
+        When ``agent`` is provided, guardrail role resolution reads
+        ``agent.agent_type`` dynamically (so workflow activation mutating
+        the role takes effect without reconnecting). When only
+        ``agent_type`` is provided, the role is static (tests/legacy).
+        """
         hooks = self._plan_mode_hooks()
 
         # Rule-evaluation hooks (extracted to guardrails/hooks.py)
-        guardrail_hooks = self._guardrail_hooks(agent_role=agent_type)
+        guardrail_hooks = self._guardrail_hooks(agent=agent, agent_role=agent_type)
         for event, matchers in guardrail_hooks.items():
             hooks.setdefault(event, []).extend(matchers)
 
-        # PostCompact hook — re-injects phase context after /compact
+        # PostCompact hook — re-injects phase context after /compact.
+        # Role comes from the agent (dynamic) or from the static agent_type.
+        role_for_compact = (agent.agent_type if agent is not None else agent_type) or ""
         if self._workflow_engine:
             from claudechic.workflows.agent_folders import create_post_compact_hook
 
             compact_hooks = create_post_compact_hook(
                 engine=self._workflow_engine,
-                agent_role=agent_type or "",
+                agent_role=role_for_compact,
                 workflows_dir=self._resolved_workflows_dir or self._cwd / "workflows",
+                variables=self._workflow_template_variables(),
             )
             for event, matchers in compact_hooks.items():
                 hooks.setdefault(event, []).extend(matchers)
@@ -965,12 +988,22 @@ class ChatApp(App):
         agent_name: str | None = None,
         model: str | None = None,
         agent_type: str | None = None,
+        agent: Agent | None = None,
     ) -> ClaudeAgentOptions:
         """Create SDK options with common settings.
 
         Note: can_use_tool is set by Agent.connect() to its own handler,
         which routes to permission_ui_callback set by AgentManager.
+
+        When ``agent`` is provided, guardrail hooks read the agent's role
+        dynamically via ``agent.agent_type`` — so role mutations (e.g.
+        workflow activation promoting the main agent to the coordinator)
+        take effect without reconnecting.
         """
+        # Prefer the agent's live role when available so role mutations
+        # (workflow activation) are reflected on the next SDK call.
+        if agent is not None:
+            agent_type = agent.agent_type
         # Override ANTHROPIC_API_KEY to prefer subscription auth,
         # unless ANTHROPIC_BASE_URL is set (SSO proxy needs the key).
         env: dict[str, str] = {}
@@ -994,6 +1027,13 @@ class ChatApp(App):
             PermissionMode,
             self.agent_mgr.global_permission_mode if self.agent_mgr else "auto",
         )
+        # Resolve effort level from the agent (if provided) or app default
+        effort_level: str | None = None
+        if agent is not None:
+            effort_level = agent.effort
+        elif self._agent is not None:
+            effort_level = self._agent.effort
+
         return ClaudeAgentOptions(
             permission_mode=permission_mode,
             env=env,
@@ -1002,10 +1042,11 @@ class ChatApp(App):
             cwd=cwd,
             resume=resume,
             model=model,
+            effort=effort_level,
             mcp_servers={"chic": create_chic_server(caller_name=agent_name)},
             include_partial_messages=True,
             stderr=self._handle_sdk_stderr,
-            hooks=self._merged_hooks(agent_type=agent_type),
+            hooks=self._merged_hooks(agent=agent, agent_type=agent_type),
             enable_file_checkpointing=True,
             extra_args=self._build_extra_args(),
         )
@@ -1059,6 +1100,7 @@ class ChatApp(App):
                 resume=session_id,
                 agent_name=agent.name,
                 model=agent.model,
+                agent=agent,
             )
             await agent.connect(options, resume=session_id)
         except Exception as e:
@@ -1153,8 +1195,14 @@ class ChatApp(App):
         if self.agent_mgr is None:
             return
 
-        # Create initial agent (now that widgets are mounted)
-        self.agent_mgr.create_unconnected(name=self._cwd.name, cwd=self._cwd)
+        # Create initial agent (now that widgets are mounted). The main
+        # agent starts with the DEFAULT_ROLE sentinel — if a workflow is
+        # later activated, _activate_workflow promotes it to main_role.
+        from claudechic.workflows.agent_folders import DEFAULT_ROLE
+
+        self.agent_mgr.create_unconnected(
+            name=self._cwd.name, cwd=self._cwd, agent_type=DEFAULT_ROLE
+        )
 
         # Populate ghost worktrees (feature branches only)
         self._populate_worktrees()
@@ -1281,7 +1329,11 @@ class ChatApp(App):
 
         # Connect the agent to SDK
         options = self._make_options(
-            cwd=agent.cwd, resume=resume, agent_name=agent.name, model=agent.model
+            cwd=agent.cwd,
+            resume=resume,
+            agent_name=agent.name,
+            model=agent.model,
+            agent=agent,
         )
         try:
             await agent.connect(options, resume=resume)
@@ -1528,7 +1580,7 @@ class ChatApp(App):
             from claudechic.workflows.loader import ManifestLoader
 
             self._token_store = OverrideTokenStore()
-            self._hit_logger = HitLogger(self._cwd / ".claude" / "hits.jsonl")
+            self._hit_logger = HitLogger(self._cwd / ".claudechic" / "hits.jsonl")
 
             # Look for project-level overrides first, fall back to bundled defaults
             _defaults = Path(__file__).parent / "defaults"
@@ -1654,12 +1706,48 @@ class ChatApp(App):
                     )
                     return
 
+            from claudechic.paths import compute_state_dir
+
+            state_dir = compute_state_dir(self._cwd, workflow_id)
+            state_dir.mkdir(parents=True, exist_ok=True)
+
             self._workflow_engine = WorkflowEngine(
                 manifest=manifest,
                 persist_fn=self._make_persist_fn(),
                 confirm_callback=self._make_confirm_callback(),
+                # Pin advance_checks to the main agent's cwd so relative
+                # patterns in the manifest (e.g. `.project_team/*/...`)
+                # resolve against the workflow root, not the Python
+                # process's cwd.
+                workflow_root=self._cwd,
+                state_dir=state_dir,
             )
+            log.info("Workflow state directory: %s", state_dir)
+
+            # Warn if old .project_team/ directory exists in repo
+            old_dir = self._cwd / ".project_team"
+            if old_dir.is_dir():
+                self.notify(
+                    f"Found existing .project_team/ in repo. "
+                    f"Workflow state now lives at {state_dir}. "
+                    "Review or remove the old directory.",
+                    severity="warning",
+                )
             phase = self._workflow_engine.get_current_phase()
+
+            # Promote the main agent into the workflow's main_role so
+            # role-scoped guardrails (e.g. `roles: [coordinator]`) apply
+            # to it. Guardrail hooks read agent.agent_type dynamically,
+            # so the change takes effect on the next rule evaluation
+            # without any reconnect. Untyped sub-agents keep DEFAULT_ROLE.
+            if wf_data.main_role and self._agent is not None:
+                self._agent.agent_type = wf_data.main_role
+                log.info(
+                    "Promoted main agent '%s' to role '%s' on workflow '%s' activation",
+                    self._agent.name,
+                    wf_data.main_role,
+                    workflow_id,
+                )
 
             # Write phase context to .claude/phase_context.md so it becomes
             # part of the system prompt, rather than injecting into the chat.
@@ -1852,6 +1940,21 @@ class ChatApp(App):
             log.warning("Failed to auto-create chicsession '%s'", name, exc_info=True)
             return None
 
+    def _workflow_template_variables(self) -> dict[str, str] | None:
+        """Build template variable dict for workflow prompt expansion.
+
+        Returns ``{"$STATE_DIR": "...", "$WORKFLOW_ROOT": "..."}`` when
+        a workflow engine is active, or ``None`` otherwise.
+        """
+        engine = self._workflow_engine
+        if engine is None:
+            return None
+        variables: dict[str, str] = {}
+        if engine.state_dir is not None:
+            variables["$STATE_DIR"] = str(engine.state_dir)
+        variables["$WORKFLOW_ROOT"] = str(self._cwd)
+        return variables or None
+
     def _inject_phase_prompt_to_main_agent(
         self,
         workflow_id: str,
@@ -1880,11 +1983,15 @@ class ChatApp(App):
         try:
             from claudechic.workflows.agent_folders import assemble_phase_prompt
 
+            variables = self._workflow_template_variables()
             prompt = assemble_phase_prompt(
-                workflows_dir=getattr(self, "_resolved_workflows_dir", Path.cwd() / "workflows"),
+                workflows_dir=getattr(
+                    self, "_resolved_workflows_dir", Path.cwd() / "workflows"
+                ),
                 workflow_id=workflow_id,
                 role_name=main_role,
                 current_phase=current_phase,
+                variables=variables,
             )
             claude_dir = Path.cwd() / ".claude"
             phase_file = claude_dir / "phase_context.md"
@@ -1938,7 +2045,29 @@ class ChatApp(App):
             return
 
         wf_id = self._workflow_engine.workflow_id
+        prior_main_role = getattr(self._workflow_engine.manifest, "main_role", None)
         self._workflow_engine = None
+
+        # Demote the main agent back to DEFAULT_ROLE if we previously
+        # promoted it to the workflow's main_role on activation. Leave
+        # untyped sub-agents alone (they already carry DEFAULT_ROLE or
+        # were given an explicit role at spawn time).
+        from claudechic.workflows.agent_folders import DEFAULT_ROLE
+
+        if (
+            prior_main_role
+            and self._agent is not None
+            and self._agent.agent_type == prior_main_role
+        ):
+            self._agent.agent_type = DEFAULT_ROLE
+            log.info(
+                "Demoted main agent '%s' from '%s' to '%s' on workflow "
+                "'%s' deactivation",
+                self._agent.name,
+                prior_main_role,
+                DEFAULT_ROLE,
+                wf_id,
+            )
 
         # Clear workflow_state from chicsession if present
         if self._chicsession_name:
@@ -2043,13 +2172,38 @@ class ChatApp(App):
                 main_role=wf_data.main_role,
             )
 
+            from claudechic.paths import compute_state_dir
+
+            state_dir = compute_state_dir(self._cwd, wf_id)
+            state_dir.mkdir(parents=True, exist_ok=True)
+
             self._workflow_engine = WorkflowEngine.from_session_state(
                 state=cs.workflow_state,
                 manifest=manifest,
                 persist_fn=self._make_persist_fn(),
                 confirm_callback=self._make_confirm_callback(),
+                # Match _activate_workflow: pin checks to the main agent's
+                # cwd so advance_checks in a restored session behave
+                # identically to a freshly activated one.
+                workflow_root=self._cwd,
+                state_dir=state_dir,
             )
+            log.info("Workflow state directory: %s", state_dir)
             phase = self._workflow_engine.get_current_phase()
+
+            # Restore the main agent's role to the workflow's main_role,
+            # mirroring what _activate_workflow does on a fresh activation.
+            # Without this, a restored session's main agent would stay on
+            # DEFAULT_ROLE and bypass role-scoped guardrails.
+            if wf_data.main_role and self._agent is not None:
+                self._agent.agent_type = wf_data.main_role
+                log.info(
+                    "Restored main agent '%s' to role '%s' for workflow '%s'",
+                    self._agent.name,
+                    wf_data.main_role,
+                    wf_id,
+                )
+
             self.notify(f"Restored workflow '{wf_id}' — phase: {phase or 'none'}")
         except Exception:
             log.debug("Failed to restore workflow from session", exc_info=True)
@@ -3194,6 +3348,7 @@ class ChatApp(App):
                     resume=resume_id,
                     agent_name=agent.name,
                     model=agent.model,
+                    agent=agent,
                 )
             )
 
@@ -3321,24 +3476,61 @@ class ChatApp(App):
         """Handle model label press - open model selector."""
         self._handle_model_prompt()
 
-    def on_diagnostics_label_requested(self, event: DiagnosticsLabel.Requested) -> None:  # noqa: ARG002
-        """Handle diagnostics label press - open diagnostics modal."""
-        from claudechic.widgets.modals.diagnostics import DiagnosticsModal
+    def on_effort_label_cycled(self, event: EffortLabel.Cycled) -> None:
+        """Handle effort label click — cycle to next effort level."""
+        agent = self._agent
+        if not agent:
+            return
+        agent.effort = event.effort
+        self.status_footer.effort = event.effort
+        self.notify(f"Effort: {event.effort}")
+
+    def on_info_label_requested(self, event: InfoLabel.Requested) -> None:  # noqa: ARG002
+        """Handle info label press - open unified info modal."""
+        from claudechic.widgets.modals.computer_info import ComputerInfoModal
 
         agent = self._agent
         session_id = agent.session_id if agent else None
         cwd = agent.cwd if agent else None
-        self.push_screen(DiagnosticsModal(session_id=session_id, cwd=cwd))
+        self.push_screen(ComputerInfoModal(cwd=cwd, session_id=session_id))
 
-    def on_computer_info_label_requested(
-        self, event: ComputerInfoLabel.Requested
-    ) -> None:  # noqa: ARG002
-        """Handle sys label press - open computer info modal."""
-        from claudechic.widgets.modals.computer_info import ComputerInfoModal
+    def on_guardrails_label_requested(self, event: GuardrailsLabel.Requested) -> None:  # noqa: ARG002
+        """Handle guardrails label press - open guardrails modal."""
+        from claudechic.guardrails.digest import compute_digest
+        from claudechic.widgets.modals.guardrails import GuardrailsModal, GuardrailToggled
+
+        if not self._manifest_loader:
+            self.notify("Guardrails not initialized", severity="warning")
+            return
 
         agent = self._agent
-        cwd = agent.cwd if agent else None
-        self.push_screen(ComputerInfoModal(cwd=cwd))
+        agent_role = agent.agent_type if agent else None
+        active_wf = (
+            self._workflow_engine.workflow_id if self._workflow_engine else None
+        )
+        current_phase = (
+            self._workflow_engine.get_current_phase()
+            if self._workflow_engine
+            else None
+        )
+
+        entries = compute_digest(
+            loader=self._manifest_loader,
+            active_wf=active_wf,
+            agent_role=agent_role,
+            current_phase=current_phase,
+            disabled_rules=self._disabled_rules,
+        )
+
+        modal = GuardrailsModal(entries)
+        self.push_screen(modal)
+
+    def on_guardrail_toggled(self, event) -> None:
+        """Handle checkbox toggle in guardrails modal."""
+        if event.enabled:
+            self._disabled_rules.discard(event.rule_id)
+        else:
+            self._disabled_rules.add(event.rule_id)
 
     def on_chicsession_actions_workflow_picker_requested(
         self,
@@ -3486,6 +3678,7 @@ class ChatApp(App):
             agent_name=agent.name,
             model=agent.model,
             agent_type=agent.agent_type,
+            agent=agent,
         )
         await agent.connect(options, resume=session_id)
 
@@ -3500,7 +3693,7 @@ class ChatApp(App):
             chat_view.clear()
         await agent.disconnect()
         options = self._make_options(
-            cwd=agent.cwd, agent_name=agent.name, model=agent.model
+            cwd=agent.cwd, agent_name=agent.name, model=agent.model, agent=agent
         )
         await agent.connect(options)
         self.refresh_context()
@@ -3551,6 +3744,7 @@ class ChatApp(App):
                 agent_name=agent.name,
                 model=model,
                 resume=session_id,
+                agent=agent,
             )
             await agent.connect(options, resume=session_id)
 
@@ -3687,7 +3881,7 @@ class ChatApp(App):
             # Reconnect with fresh session (like /clear)
             await agent.disconnect()
             options = self._make_options(
-                cwd=agent.cwd, agent_name=agent.name, model=agent.model
+                cwd=agent.cwd, agent_name=agent.name, model=agent.model, agent=agent
             )
             await agent.connect(options)
 
@@ -3990,6 +4184,7 @@ class ChatApp(App):
         # Update footer
         self.status_footer.permission_mode = new_agent.permission_mode
         self._update_footer_model(new_agent.model)
+        self.status_footer.effort = new_agent.effort
         agent_count = len(self.agent_mgr.agents) if self.agent_mgr else 1
         self.status_footer.update_agent_label(new_agent.name, visible=(agent_count > 1))
 
@@ -4513,6 +4708,17 @@ class ChatApp(App):
 
         # Update context bar's max tokens based on model
         self.context_bar.max_tokens = get_context_window(model)
+
+        # Update effort label's available levels for this model.
+        # If the current effort level isn't valid for the new model, the label
+        # snaps to the closest valid one — sync that back to the agent.
+        if effort_label := self.query_one_optional("#effort-label", EffortLabel):
+            old_effort = effort_label._effort
+            effort_label.set_available_levels(EffortLabel.levels_for_model(model))
+            if effort_label._effort != old_effort:
+                self.status_footer.effort = effort_label._effort
+                if agent := self._agent:
+                    agent.effort = effort_label._effort
 
         if not self._available_models:
             # No model info yet - show raw value or empty

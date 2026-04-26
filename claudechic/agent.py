@@ -192,7 +192,12 @@ class Agent:
         self.name = name
         self.cwd = cwd
         self.worktree = worktree
-        self.agent_type = agent_type
+        # Agents default to the DEFAULT_ROLE sentinel when no role is
+        # provided. The main agent is promoted to the workflow's main_role
+        # on activation (see ChatApp._activate_workflow) and reverted on
+        # deactivation. DEFAULT_ROLE carries no workflow-specific
+        # guardrails or phase injections.
+        self.agent_type = agent_type if agent_type is not None else "default"
 
         # SDK
         self.client: ClaudeSDKClient | None = None
@@ -233,6 +238,7 @@ class Agent:
         self._reply_nudge_count: int = 0  # How many nudges sent for current obligation
         self._nudge_generation: int = 0  # Monotonic counter to deduplicate nudge timers
         self.model: str | None = "opus"  # Model override (None = SDK default)
+        self.effort: str = "high"  # Effort level (low, medium, high, max)
 
         # Worktree finish state (for /worktree finish flow)
         self.finish_state: FinishState | None = None

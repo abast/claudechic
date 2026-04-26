@@ -152,13 +152,16 @@ class AgentManager:
         # Wire callbacks
         self._wire_agent_callbacks(agent)
 
-        # Create options and connect
+        # Create options and connect. Pass the agent so guardrail hooks can
+        # read agent.agent_type dynamically — important for the main agent,
+        # whose role flips to main_role on workflow activation.
         options = self._options_factory(
             cwd=cwd,
             resume=resume,
             agent_name=agent.name,
             model=model,
             agent_type=agent_type,
+            agent=agent,
         )
         await agent.connect(options, resume=resume)
 
@@ -198,6 +201,7 @@ class AgentManager:
             agent_name=agent.name,
             model=model,
             agent_type=agent.agent_type,
+            agent=agent,
         )
         await agent.connect(options, resume=resume)
 

@@ -26,7 +26,7 @@ You do NOT:
 **If user sends "x":** This means they think you are deviating from your role.
 - STOP immediately
 - Re-read this entire file
-- Re-read STATUS.md
+- Re-read $STATE_DIR/STATUS.md
 - Confirm you are following the workflow before continuing
 
 ---

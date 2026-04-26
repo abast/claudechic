@@ -12,7 +12,7 @@ A structured multi-agent workflow for building software projects with Claude Cod
 
 You describe what you want to build. The agent clarifies your intent -- spelling out what success and failure look like -- and iterates with you until it's correct and complete. You're also asked where the project lives (new or existing directory).
 
-The agent creates `.project_team/{project_name}/` with:
+The agent creates the state directory (`$STATE_DIR`) with:
 - `userprompt.md` -- your verbatim prompt + the approved vision
 - `STATUS.md` -- tracks workflow progress
 
@@ -20,7 +20,7 @@ The agent creates `.project_team/{project_name}/` with:
 
 ### 2. Specification (4 leadership agents)
 
-The Coordinator's prime directive is **"Delegate, don't do."** It spawns leadership agents that draft a specification together, saved under `.project_team/{project_name}/specification/`.
+The Coordinator's prime directive is **"Delegate, don't do."** It spawns leadership agents that draft a specification together, saved under `$STATE_DIR/specification/`.
 
 **User checkpoint:** approve the specification before implementation begins.
 

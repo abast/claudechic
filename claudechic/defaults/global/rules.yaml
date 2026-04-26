@@ -29,6 +29,13 @@
     Use: TS=$(date -u +%Y-%m-%d_%H%M%S) && pytest --junitxml=.test_results/${TS}.xml --tb=short 2>&1 | tee .test_results/${TS}.log
     Or target a specific test: pytest tests/test_foo.py
 
+- id: pytest_needs_timeout
+  trigger: PreToolUse/Bash
+  enforcement: warn
+  detect:
+    pattern: "(?:^|[;&|]\\s*)(?:python\\s+-m\\s+)?pytest\\b(?!.*--timeout)"
+  message: "pytest invoked without --timeout. Add --timeout=<seconds> to prevent runaway tests."
+
 - id: no_pip_install
   trigger: PreToolUse/Bash
   enforcement: deny

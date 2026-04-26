@@ -14,21 +14,21 @@ from claudechic.widgets.input.vi_mode import ViMode
 from claudechic.widgets.layout.indicators import ContextBar, CPUBar, ProcessIndicator
 
 
-class DiagnosticsLabel(ClickableLabel):
-    """Clickable diagnostics label."""
+class InfoLabel(ClickableLabel):
+    """Clickable 'info' label that opens the unified Info modal."""
 
     class Requested(Message):
-        """Emitted when user clicks to open diagnostics."""
+        """Emitted when user clicks to open info modal."""
 
     def on_click(self, event) -> None:
         self.post_message(self.Requested())
 
 
-class ComputerInfoLabel(ClickableLabel):
-    """Clickable 'sys' label that opens ComputerInfoModal."""
+class GuardrailsLabel(ClickableLabel):
+    """Clickable 'guardrails' label that opens the guardrails modal."""
 
     class Requested(Message):
-        """Emitted when user clicks to open computer info."""
+        """Emitted when user clicks to open guardrails modal."""
 
     def on_click(self, event) -> None:
         self.post_message(self.Requested())
@@ -89,6 +89,99 @@ class ModelLabel(ClickableLabel):
 
     def on_click(self, event) -> None:
         self.post_message(self.ModelChangeRequested())
+
+
+class EffortLabel(ClickableLabel):
+    """Clickable effort level label — cycles through available effort levels.
+
+    The available levels are model-dependent. Use ``set_available_levels()``
+    to restrict the cycle when the model changes.
+    """
+
+    # Default levels when no model-specific info is available.
+    DEFAULT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "max")
+
+    # Per-model effort levels.  "max" triggers extended thinking which is
+    # only supported by Opus.
+    MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+        "haiku": ("low", "medium", "high"),
+        "sonnet": ("low", "medium", "high"),
+        "opus": ("low", "medium", "high", "max"),
+    }
+
+    EFFORT_DISPLAY = {
+        "low": "⚡ low",
+        "medium": "effort: med",
+        "high": "effort: high",
+        "max": "effort: max",
+    }
+
+    class Cycled(Message):
+        """Emitted when user clicks to cycle effort level."""
+
+        def __init__(self, effort: str) -> None:
+            super().__init__()
+            self.effort = effort
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._effort: str = "high"
+        self._levels: tuple[str, ...] = self.DEFAULT_LEVELS
+
+    def on_click(self, event) -> None:
+        levels = self._levels
+        idx = levels.index(self._effort) if self._effort in levels else len(levels) - 1
+        next_effort = levels[(idx + 1) % len(levels)]
+        self.set_effort(next_effort)
+        self.post_message(self.Cycled(next_effort))
+
+    def set_effort(self, effort: str) -> None:
+        """Update the displayed effort level."""
+        self._effort = effort
+        self.update(self.EFFORT_DISPLAY.get(effort, f"effort: {effort}"))
+
+    def set_available_levels(self, levels: tuple[str, ...]) -> None:
+        """Update the set of effort levels available for cycling.
+
+        If the current effort level is not in the new set, snaps to the
+        closest valid level (by index in the global ordering).
+        """
+        if not levels:
+            return
+        self._levels = levels
+        if self._effort not in levels:
+            # Snap to closest: find the highest level in the new set that
+            # doesn't exceed the current position in the global ordering.
+            global_order = ("low", "medium", "high", "max")
+            try:
+                cur_idx = global_order.index(self._effort)
+            except ValueError:
+                cur_idx = len(global_order) - 1
+            # Pick the highest level in `levels` that is <= cur_idx
+            best = levels[0]
+            for lvl in levels:
+                try:
+                    if global_order.index(lvl) <= cur_idx:
+                        best = lvl
+                except ValueError:
+                    pass
+            self.set_effort(best)
+
+    @classmethod
+    def levels_for_model(cls, model: str | None) -> tuple[str, ...]:
+        """Return the valid effort levels for a model string.
+
+        Matches against known model families by checking if the model
+        string contains a known alias (e.g. "opus", "sonnet", "haiku").
+        Falls back to DEFAULT_LEVELS if unrecognised.
+        """
+        if not model:
+            return cls.DEFAULT_LEVELS
+        model_lower = model.lower()
+        for family, levels in cls.MODEL_EFFORT_LEVELS.items():
+            if family in model_lower:
+                return levels
+        return cls.DEFAULT_LEVELS
 
 
 class ViModeLabel(Static):
@@ -155,6 +248,7 @@ class StatusFooter(Static):
     can_focus = False
     permission_mode = reactive("auto")  # auto, default, acceptEdits, plan
     model = reactive("")
+    effort = reactive("high")  # low, medium, high, max
     branch = reactive("")
 
     async def on_mount(self) -> None:
@@ -169,16 +263,16 @@ class StatusFooter(Static):
             yield ViModeLabel("", id="vi-mode-label", classes="hidden")
             yield ModelLabel("", id="model-label", classes="footer-label")
             yield Static("·", classes="footer-sep")
+            yield EffortLabel("effort: high", id="effort-label", classes="footer-label")
+            yield Static("·", classes="footer-sep")
             yield PermissionModeLabel(
                 "Auto-edit: off", id="permission-mode-label", classes="footer-label"
             )
             yield Static("·", classes="footer-sep")
-            yield DiagnosticsLabel(
-                "session_info", id="diagnostics-label", classes="footer-label"
-            )
+            yield InfoLabel("info", id="info-label", classes="footer-label")
             yield Static("·", classes="footer-sep")
-            yield ComputerInfoLabel(
-                "sys", id="computer-info-label", classes="footer-label"
+            yield GuardrailsLabel(
+                "guardrails", id="guardrails-label", classes="footer-label"
             )
             yield Static("", id="footer-spacer")
             yield ProcessIndicator(id="process-indicator", classes="hidden")
@@ -196,6 +290,11 @@ class StatusFooter(Static):
         """Update model label when model changes."""
         if label := self.query_one_optional("#model-label", ModelLabel):
             label.update(value if value else "")
+
+    def watch_effort(self, value: str) -> None:
+        """Update effort label when effort changes."""
+        if label := self.query_one_optional("#effort-label", EffortLabel):
+            label.set_effort(value)
 
     def watch_permission_mode(self, value: str) -> None:
         """Update permission mode label when setting changes."""

@@ -256,6 +256,22 @@ class ManifestLoader:
             if not self._is_global_path(path):
                 wf_id = data.get("workflow_id", path.parent.name)
                 main_role = data.get("main_role")
+                # "default" is the reserved sentinel for agents with no
+                # role wiring — a workflow can't use it as main_role.
+                from claudechic.workflows.agent_folders import DEFAULT_ROLE
+
+                if main_role == DEFAULT_ROLE:
+                    errors.append(
+                        LoadError(
+                            source=str(path),
+                            section="main_role",
+                            message=(
+                                f"main_role cannot be '{DEFAULT_ROLE}' — "
+                                "that name is reserved for the no-role sentinel."
+                            ),
+                        )
+                    )
+                    main_role = None
                 workflows.setdefault(
                     wf_id,
                     WorkflowData(

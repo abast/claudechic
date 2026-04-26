@@ -85,7 +85,15 @@ ModelLabel:hover {
     background: $panel;
 }
 
-DiagnosticsLabel:hover {
+EffortLabel:hover {
+    background: $panel;
+}
+
+InfoLabel:hover {
+    background: $panel;
+}
+
+GuardrailsLabel:hover {
     background: $panel;
 }
 

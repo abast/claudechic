@@ -11,6 +11,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from claudechic.checks.adapter import check_failed_to_hint
@@ -82,11 +83,28 @@ class WorkflowEngine:
         manifest: WorkflowManifest,
         persist_fn: PersistFn,
         confirm_callback: AsyncConfirmCallback,
+        workflow_root: Path | None = None,
+        state_dir: Path | None = None,
     ) -> None:
         self._manifest = manifest
         self._persist_fn = persist_fn
         self._confirm_callback = confirm_callback
         self._advance_lock = asyncio.Lock()  # Prevent concurrent advance
+        # Pin checks to a stable working directory (typically the main
+        # agent's cwd). Relative paths in check declarations — e.g.
+        # `.project_team/*/specification/SPECIFICATION.md` — resolve
+        # against this root instead of the Python process's cwd, which
+        # avoids false negatives when advance_phase is called by a
+        # sub-agent whose cwd or subprocess environment has drifted.
+        self._workflow_root: Path | None = (
+            Path(workflow_root) if workflow_root is not None else None
+        )
+        # Scratch state directory for workflow artifacts (specifications,
+        # reviews, etc.). Check params containing "$STATE_DIR" are expanded
+        # to this absolute path before execution.
+        self._state_dir: Path | None = (
+            Path(state_dir) if state_dir is not None else None
+        )
 
         # Phase state — in-memory, persisted via callback
         self._current_phase: str | None = None
@@ -100,6 +118,11 @@ class WorkflowEngine:
     @property
     def workflow_id(self) -> str:
         return self._manifest.workflow_id
+
+    @property
+    def state_dir(self) -> Path | None:
+        """Scratch state directory, or None if not configured."""
+        return self._state_dir
 
     @property
     def manifest(self) -> WorkflowManifest:
@@ -180,8 +203,13 @@ class WorkflowEngine:
                     reason=f"Unknown target phase: {next_phase}",
                 )
 
-            # Execute checks sequentially — AND semantics, short-circuit
-            for check_decl in advance_checks:
+            # Two-pass execution: automated checks first, then manual
+            # confirms. This avoids prompting the user for confirmation
+            # when an automated check is already going to fail.
+            auto_checks = [c for c in advance_checks if c.type != "manual-confirm"]
+            manual_checks = [c for c in advance_checks if c.type == "manual-confirm"]
+
+            for check_decl in (*auto_checks, *manual_checks):
                 result = await self._run_single_check(check_decl)
                 if not result.passed:
                     # Bridge failure to hints pipeline
@@ -268,6 +296,8 @@ class WorkflowEngine:
         manifest: WorkflowManifest,
         persist_fn: PersistFn,
         confirm_callback: AsyncConfirmCallback,
+        workflow_root: Path | None = None,
+        state_dir: Path | None = None,
     ) -> WorkflowEngine:
         """Restore engine from persisted session state.
 
@@ -276,11 +306,13 @@ class WorkflowEngine:
             manifest: Parsed workflow manifest (re-loaded, not persisted).
             persist_fn: Callback for future state persistence.
             confirm_callback: Callback for ManualConfirm checks.
+            workflow_root: Pin checks to this directory (see __init__).
+            state_dir: Scratch state directory (see __init__).
 
         Returns:
             Restored WorkflowEngine with phase state from session.
         """
-        engine = cls(manifest, persist_fn, confirm_callback)
+        engine = cls(manifest, persist_fn, confirm_callback, workflow_root, state_dir)
 
         if state is None:
             return engine  # Keep default first phase from __init__
@@ -307,6 +339,21 @@ class WorkflowEngine:
         try:
             # Inject confirm_fn for ManualConfirm checks
             params = dict(check_decl.params)
+
+            # Uniform variable expansion — every consumer gets pre-expanded
+            # absolute paths through the same mechanism.
+            expansions: dict[str, str] = {}
+            if self._state_dir is not None:
+                expansions["$STATE_DIR"] = str(self._state_dir)
+            if self._workflow_root is not None:
+                expansions["$WORKFLOW_ROOT"] = str(self._workflow_root)
+            if expansions:
+                for k, v in params.items():
+                    if isinstance(v, str):
+                        for var, replacement in expansions.items():
+                            if var in v:
+                                v = v.replace(var, replacement)
+                        params[k] = v
             if check_decl.type == "manual-confirm":
                 params["confirm_fn"] = self._confirm_callback
                 # Inject phase context at invocation time (not closure time)
@@ -321,6 +368,17 @@ class WorkflowEngine:
                     "phase_total": len(phase_order),
                     "check_id": check_decl.id,
                 }
+
+            # Pin checks to the workflow root when the manifest doesn't
+            # already override. Shell checks inherit `cwd`; file checks
+            # resolve relative paths via `base_dir`. Manifests can still
+            # opt out by setting either key explicitly (e.g. an absolute
+            # path, or a different cwd for a dev-specific check).
+            if self._workflow_root is not None:
+                if check_decl.type == "command-output-check":
+                    params.setdefault("cwd", str(self._workflow_root))
+                elif check_decl.type in ("file-exists-check", "file-content-check"):
+                    params.setdefault("base_dir", str(self._workflow_root))
 
             # Build check from registry using potentially modified params
             augmented_decl = CheckDecl(

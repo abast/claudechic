@@ -27,7 +27,7 @@ phases:
         lifecycle: show-once
       - message: "Try: ask the agent to run 'sudo echo hi' -- warn rule should fire, agent can acknowledge."
         lifecycle: show-once
-      - message: "Try: ask the agent to run 'git status' -- log rule fires silently, check .claude/hits.jsonl."
+      - message: "Try: ask the agent to run 'git status' -- log rule fires silently, check .claudechic/hits.jsonl."
         lifecycle: show-once
     advance_checks:
       - type: file-exists-check

@@ -22,7 +22,7 @@ There are three enforcement levels, from strictest to silent:
 2. **warn** -- Blocks the action, but the agent can acknowledge and proceed via `acknowledge_warning` MCP.
    Try: ask the agent to run `sudo echo hi`
 
-3. **log** -- Silent. The action proceeds, but a record is written to `.claude/hits.jsonl`.
+3. **log** -- Silent. The action proceeds, but a record is written to `.claudechic/hits.jsonl`.
    Try: ask the agent to run `git status`, then check the log file.
 
 Rules are defined in YAML and can be scoped globally or to specific workflow phases.

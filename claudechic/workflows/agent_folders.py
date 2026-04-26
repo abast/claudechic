@@ -16,6 +16,12 @@ from claude_agent_sdk.types import HookMatcher
 
 logger = logging.getLogger(__name__)
 
+# Sentinel role for agents with no workflow-specific role wiring.
+# The main agent starts with this role and is promoted to the workflow's
+# main_role on activation. Sub-agents spawned without an explicit type=
+# also get this role. Reserved — workflow role folders must not use it.
+DEFAULT_ROLE = "default"
+
 
 def _find_workflow_dir(workflows_dir: Path, workflow_id: str) -> Path | None:
     """Find the workflow directory for a given workflow_id.
@@ -84,6 +90,7 @@ def assemble_phase_prompt(
     workflow_id: str,
     role_name: str,
     current_phase: str | None,
+    variables: dict[str, str] | None = None,
 ) -> str | None:
     """Get full system prompt content for an agent.
 
@@ -95,19 +102,31 @@ def assemble_phase_prompt(
         workflow_id: Kebab-case workflow ID (e.g. "project-team").
         role_name: Agent role folder name (e.g. "coordinator").
         current_phase: Current phase ID, or None.
+        variables: Optional variable expansion dict (e.g.
+            ``{"$STATE_DIR": "/abs/path", "$WORKFLOW_ROOT": "/abs/path"}``).
+            Applied uniformly via ``str.replace`` — callers decide what
+            variables exist; this function is agnostic.
     """
     workflow_dir = _find_workflow_dir(workflows_dir, workflow_id)
     if workflow_dir is None:
         return None
 
     result = _assemble_agent_prompt(workflow_dir, role_name, current_phase)
-    return result or None
+    if not result:
+        return None
+
+    if variables:
+        for var, value in variables.items():
+            result = result.replace(var, value)
+
+    return result
 
 
 def create_post_compact_hook(
     engine: Any,  # WorkflowEngine — avoid circular import
     agent_role: str,
     workflows_dir: Path,
+    variables: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create a per-agent PostCompact hook that re-injects phase context.
 
@@ -119,6 +138,8 @@ def create_post_compact_hook(
         engine: WorkflowEngine instance (provides workflow_id and current phase).
         agent_role: Role name for this agent (e.g. "coordinator").
         workflows_dir: Project-side workflows/ directory path.
+        variables: Optional template variable expansion dict (e.g.
+            ``{"$STATE_DIR": "/abs/path", "$WORKFLOW_ROOT": "/abs/path"}``).
 
     Returns:
         Hook configuration dict for SDK hook registration.
@@ -132,7 +153,8 @@ def create_post_compact_hook(
         workflow_id = engine.workflow_id
 
         prompt = assemble_phase_prompt(
-            workflows_dir, workflow_id, agent_role, current_phase
+            workflows_dir, workflow_id, agent_role, current_phase,
+            variables=variables,
         )
         if prompt:
             logger.debug(

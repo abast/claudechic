@@ -6,4 +6,4 @@
 4. Find and define clean seams between axes
 5. Report to Coordinator: axes, laws, potential crystal holes
 6. Spawn axis-specific agents for deep review if needed
-7. Write findings to specification/composability.md
+7. Write findings to $STATE_DIR/specification/composability.md
