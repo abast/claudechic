@@ -3495,42 +3495,8 @@ class ChatApp(App):
         self.push_screen(ComputerInfoModal(cwd=cwd, session_id=session_id))
 
     def on_guardrails_label_requested(self, event: GuardrailsLabel.Requested) -> None:  # noqa: ARG002
-        """Handle guardrails label press - open guardrails modal."""
-        from claudechic.guardrails.digest import compute_digest
-        from claudechic.widgets.modals.guardrails import GuardrailsModal, GuardrailToggled
-
-        if not self._manifest_loader:
-            self.notify("Guardrails not initialized", severity="warning")
-            return
-
-        agent = self._agent
-        agent_role = agent.agent_type if agent else None
-        active_wf = (
-            self._workflow_engine.workflow_id if self._workflow_engine else None
-        )
-        current_phase = (
-            self._workflow_engine.get_current_phase()
-            if self._workflow_engine
-            else None
-        )
-
-        entries = compute_digest(
-            loader=self._manifest_loader,
-            active_wf=active_wf,
-            agent_role=agent_role,
-            current_phase=current_phase,
-            disabled_rules=self._disabled_rules,
-        )
-
-        modal = GuardrailsModal(entries)
-        self.push_screen(modal)
-
-    def on_guardrail_toggled(self, event) -> None:
-        """Handle checkbox toggle in guardrails modal."""
-        if event.enabled:
-            self._disabled_rules.discard(event.rule_id)
-        else:
-            self._disabled_rules.add(event.rule_id)
+        """Handle guardrails label press - placeholder for future guardrails modal."""
+        self.notify("Guardrails viewer not yet implemented", severity="information")
 
     def on_chicsession_actions_workflow_picker_requested(
         self,
